@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/task-request.schema.json",
+  "title": "TaskRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "repo", "base_ref"],
+  "properties": {
+    "task": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 4000
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+    },
+    "base_ref": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._/-]{1,128}$"
+    },
+    "model": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+/[a-z0-9._-]+$"
+    },
+    "allowed_paths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "default": []
+    }
+  }
+}

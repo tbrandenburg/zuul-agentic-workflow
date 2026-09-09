@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/run-summary.schema.json",
+  "title": "RunSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "request", "results", "buildset_uuid", "final_verdict", "totals"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "repo", "base_ref"],
+      "properties": {
+        "task": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "status", "summary"],
+        "properties": {
+          "role": {
+            "enum": ["planner", "coder", "reviewer", "validation"]
+          },
+          "status": {
+            "enum": ["success", "failure", "error", "skipped"]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "artifact_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "build_url": {
+            "type": "string",
+            "format": "uri"
+          }
+        }
+      }
+    },
+    "validation_report": {
+      "type": ["object", "null"],
+      "default": null
+    },
+    "buildset_uuid": {
+      "type": "string"
+    },
+    "build_urls": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uri"
+      },
+      "default": []
+    },
+    "artifact_urls": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uri"
+      },
+      "default": []
+    },
+    "final_verdict": {
+      "enum": ["success", "failure", "error"]
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cost", "tokens_input", "tokens_output"],
+      "properties": {
+        "cost": {
+          "type": "number"
+        },
+        "tokens_input": {
+          "type": "integer"
+        },
+        "tokens_output": {
+          "type": "integer"
+        }
+      }
+    }
+  }
+}

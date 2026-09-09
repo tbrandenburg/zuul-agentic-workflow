@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/agent-input.schema.json",
+  "title": "AgentInput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "role", "task", "workspace", "model"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "role": {
+      "enum": ["planner", "coder", "reviewer"]
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description", "repo", "base_ref"],
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "base_ref": {
+          "type": "string"
+        },
+        "base_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        }
+      }
+    },
+    "upstream_results": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "summary"],
+        "properties": {
+          "role": {
+            "enum": ["planner", "coder", "reviewer", "validation"]
+          },
+          "summary": {
+            "type": "string",
+            "maxLength": 8000
+          },
+          "artifact_url": {
+            "type": "string",
+            "format": "uri"
+          },
+          "status": {
+            "enum": ["success", "failure", "error"]
+          }
+        }
+      }
+    },
+    "validation": {
+      "type": ["object", "null"],
+      "default": null
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "mode"],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": ["read-only", "read-write"]
+        }
+      }
+    },
+    "model": {
+      "type": "string"
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "timeout_ms": {
+          "type": "integer",
+          "default": 900000
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "default": 1048576
+        },
+        "max_attempts": {
+          "type": "integer",
+          "default": 3
+        }
+      }
+    }
+  }
+}

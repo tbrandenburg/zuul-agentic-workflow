@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/agent-result.schema.json",
+  "title": "AgentResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "agent", "status", "summary"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "agent": {
+      "enum": ["planner", "coder", "reviewer"]
+    },
+    "status": {
+      "enum": ["success", "failure", "error"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8000
+    },
+    "claims": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["statement", "verifiable"],
+        "properties": {
+          "statement": {
+            "type": "string"
+          },
+          "verifiable": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "state_uri": {
+      "type": "string"
+    },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "attempts": {
+          "type": "integer"
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "tokens_input": {
+          "type": "integer"
+        },
+        "tokens_output": {
+          "type": "integer"
+        },
+        "cost": {
+          "type": "number"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{"type":"step_start","timestamp":1,"sessionID":"ses_mock","part":{}}
+{"type":"text","timestamp":2,"part":{"type":"text","text":"\n\n"}}
+{"type":"tool_use","timestamp":3,"part":{"tool":"read"}}
+{"type":"step_finish","timestamp":4,"part":{"reason":"tool-calls","tokens":{"total":100,"input":80,"output":20},"cost":0.001}}
+{"type":"step_start","timestamp":5,"part":{}}
+{"type":"text","timestamp":6,"part":{"type":"text","text":"Here is my result:\n\n```json\n{\"schema_version\":1,\"run_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"agent\":\"planner\",\"status\":\"success\",\"summary\":\"Planned the trivial task.\",\"claims\":[],\"files\":[],\"next_actions\":[],\"confidence\":0.9}\n```\n"}}
+{"type":"step_finish","timestamp":7,"part":{"reason":"stop","tokens":{"total":250,"input":200,"output":50},"cost":0.002}}
