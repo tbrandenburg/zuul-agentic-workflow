@@ -1068,6 +1068,27 @@ that claims a file was produced reads it back and validates it. A Live E2E test
 that cannot prove a real model call occurred (via telemetry) is a **failing**
 test. Coverage is not a goal; finding real bugs is.
 
+**Cost discipline — Live E2E tasks must be trivial:** every Live E2E gate needs
+only enough of a real task to exercise the mechanism under test — schema
+validity, state passing, patch applicability, a specific failure mode — never
+a realistic or production-sized task. Concretely:
+
+- Task descriptions are minimal (just above the `minLength: 8` floor), e.g.
+  `"Add a comment above line 3 of foo.txt"` or `"Fix the off-by-one in add(a,b)"`.
+- `sandbox/services/example` (Phase 4+) stays a tiny repo — a handful of files,
+  a fast test suite — never a realistic-sized service.
+- Prompt templates (`prompts/*.md`) carry only the structural boilerplate
+  required for NDJSON→JSON normalisation (§5.3 step 2: embedded result schema +
+  output-contract instruction) — no extra few-shot examples, no padding.
+- `--mock`/Piped E2E remains the default inner loop for all iteration on
+  Ansible, schemas, and orchestration; Live E2E is invoked only for the gate
+  itself, never for day-to-day debugging.
+
+This is not a relaxation of the "no mocks in Live E2E" rule (§10's Anti-cheat
+rules still apply in full) — it bounds the *size* of the real task, not its
+authenticity. Assertions remain structural (schema validity, telemetry > 0,
+artifact reachability), never on prose content, so a trivial task is exactly as
+valid evidence as an elaborate one.
 
 ---
 
@@ -1312,7 +1333,7 @@ into fixture-replay.
 | R9 | Host RAM (7.3 GB) insufficient once launcher + node added | Medium | Medium | Semaphore `max: 2`; Gerrit permanently excluded; monitor in Phase 4 |
 | R10 | Zuul minor upgrade breaks config | Low | Medium | Images pinned to 14.2.0; upgrades are deliberate changes |
 | R11 | Prompt injection from the task description | Medium | Medium | Validation config lives in the trusted config-project; model output cannot alter gates |
-| R12 | Live E2E cost and wall-clock grow with every milestone | Medium | Low | Small sandbox repo; short tasks; semaphore `max: 2`; telemetry recorded per run |
+| R12 | Live E2E cost and wall-clock grow with every milestone | Medium | Low | **Trivial-task discipline (§10, "Cost discipline"): minimal task descriptions, tiny sandbox repo, boilerplate-only prompts**; semaphore `max: 2`; telemetry recorded per run |
 | R13 | Web UI shows blank build history | Low | Medium | **RESOLVED §13/Q6: anonymous read confirmed default; recipe locked in.** Residual risk is ZK/MariaDB connectivity, not config, caught by §11.7 step 9 |
 | R14 | Concurrent `POST /runs` race on the shared `agent-runs` branch push | Medium | Medium | **NEW (from §13/Q3 fix):** Run API's `git-writer` must serialize pushes (mutex/queue); added to Phase 1 tasks |
 
