@@ -1,0 +1,16 @@
+- job:
+    name: base
+    parent: null
+    abstract: true
+    description: >
+      Phase 0 minimal base job. Executor-only (no nodeset) per plan §1.10 -
+      the real agent-runner node is introduced in Phase 4.
+    timeout: 600
+
+- job:
+    name: agent-smoke
+    parent: base
+    description: >
+      Trivial executor-only job used to prove enqueue-ref -> buildset ->
+      SUCCESS with no launcher and no node (Phase 0 gate E2E-0).
+    run: playbooks/agent-smoke.yaml

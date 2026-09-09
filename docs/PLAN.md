@@ -1,6 +1,7 @@
 # Implementation Plan — Zuul Agentic Workflow PoC
 
-Status: **DRAFT — not yet executed.** Nothing in this document has been implemented.
+Status: **IN PROGRESS — Phase 0 complete** (see `zuul/README.md`). Phases 1-6
+not yet implemented.
 Last verified against live sources: **2026-09-09**.
 Source of requirements: [docs/INITIAL.md](INITIAL.md).
 
@@ -1098,27 +1099,41 @@ Each phase has a **binary** acceptance gate. Nothing advances on a partial pass.
 
 ### Phase 0 — Infrastructure spike (timebox: 1 day)
 
+**STATUS: COMPLETE.** Implementation in `zuul/` (`docker-compose.yaml`,
+`etc_zuul/`, `zuul-config/`, `gitserver-image/`, `scripts/`). Reproducible via
+`make phase0-up`, `make phase0-seed`, `make phase0-e2e-0`. Full write-up,
+deviations, and troubleshooting notes in `zuul/README.md`.
+
 All architectural questions this phase existed to de-risk are now **resolved**
 by research (§13). Phase 0 is reduced from open-ended investigation to a
 **confirmation smoke test** of already-decided behaviour, plus the one thing
 that genuinely requires running containers to observe (initializer + web UI).
 
-| # | Task |
-|---|---|
-| 0.1 | Bring up ZK + MariaDB + scheduler + web + executor + logs + gitserver, images pinned to 14.2.0 |
-| 0.2 | Host `zuul-config` (config-project) and `agent-runs` (untrusted) on a **single** git driver connection (§13/Q1: confirmed supported, no second connection needed) |
-| 0.3 | **Confirmation only:** verify the scheduler actually loads a `pipeline:`/`job:` from the git-driver config-project (closes the loop on §13/Q1's source-code finding with a live check) |
-| 0.4 | Seed the permanent `refs/heads/agent-runs` branch (`git commit --allow-empty` + push); mint a JWT; run `zuul-client enqueue-ref` with **real, non-zero** `oldrev`/`newrev` (§13/Q3) into an `independent` pipeline; confirm a buildset is created |
-| 0.5 | Run a trivial `noop`-style **executor-only** job; confirm it succeeds with no launcher and no node |
+| # | Task | Status |
+|---|---|---|
+| 0.1 | Bring up ZK + MariaDB + scheduler + web + executor + logs + gitserver, images pinned to 14.2.0 | ✅ Done |
+| 0.2 | Host `zuul-config` (config-project) and `agent-runs` (untrusted) on a **single** git driver connection (§13/Q1: confirmed supported, no second connection needed) | ✅ Done |
+| 0.3 | **Confirmation only:** verify the scheduler actually loads a `pipeline:`/`job:` from the git-driver config-project (closes the loop on §13/Q1's source-code finding with a live check) | ✅ Confirmed via `GET /api/tenant/agents/status` and `/jobs` |
+| 0.4 | Seed the permanent `refs/heads/agent-runs` branch (`git commit --allow-empty` + push); mint a JWT; run `zuul-client enqueue-ref` with **real, non-zero** `oldrev`/`newrev` (§13/Q3) into an `independent` pipeline; confirm a buildset is created | ✅ Done (`zuul/scripts/e2e-0.sh`) |
+| 0.5 | Run a trivial `noop`-style **executor-only** job; confirm it succeeds with no launcher and no node | ✅ Done (job named `agent-smoke` — see deviation note below) |
 
-**Gate `E2E-0` (non-mocked):** `zuul-client enqueue-ref` produces a buildset that
-runs an executor-only job to SUCCESS, verified by
+**Gate `E2E-0` (non-mocked): PASSED.** `zuul-client enqueue-ref` produces a
+buildset that runs an executor-only job to SUCCESS, verified by
 `GET /api/tenant/agents/buildsets` **and** by the build appearing in the web UI
-at `/t/agents/buildsets`. No stubs anywhere.
+at `/t/agents/buildsets` (screenshot:
+`.playwright-mcp/phase0-e2e0-buildsets.png`). No stubs anywhere. Reproducible
+via `make phase0-e2e-0`.
+
+**Deviation from plan:** the smoke-test job is named `agent-smoke`, not
+`noop` — `noop` is a **reserved built-in Zuul job name**; defining a custom
+job with that name causes an obscure internal `KeyError` in the tenant parser
+instead of a clear "duplicate job" error. Discovered empirically; documented
+in `zuul/README.md`'s troubleshooting section.
 
 **No Gerrit-free fallback ladder is carried forward** — §13/Q1 confirmed the
 single-connection design works from source inspection; 0.3 exists only to
 verify that finding empirically once, not to explore alternatives.
+
 
 ### Phase 1 — Zuul baseline + initializer
 

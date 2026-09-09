@@ -1,0 +1,8 @@
+- tenant:
+    name: agents
+    source:
+      agent-git:
+        config-projects:
+          - zuul-config
+        untrusted-projects:
+          - agent-runs

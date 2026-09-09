@@ -1,0 +1,144 @@
+version: '3.8'
+
+services:
+  certs-init:
+    image: alpine:3.20
+    volumes:
+      - "./tools:/tools:ro"
+      - "certs:/var/certs:z"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        /tools/zk-ca.sh /var/certs zk
+        if [ ! -f /var/certs/executor_id_rsa ]; then
+          apk add --no-cache openssh-keygen >/dev/null
+          ssh-keygen -t rsa -b 2048 -N '' -f /var/certs/executor_id_rsa
+        fi
+        chmod -R a+rX /var/certs
+        chmod 600 /var/certs/executor_id_rsa
+
+  zk:
+    image: quay.io/opendevmirror/zookeeper
+    hostname: zk
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+    volumes:
+      - "certs:/var/certs:z"
+      - "./etc_zuul/zoo.cfg:/conf/zoo.cfg:z"
+      - "zk-data:/data"
+      - "zk-datalog:/datalog"
+    networks:
+      - zuul
+
+  mysql:
+    image: quay.io/opendevmirror/mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: zuul
+      MYSQL_USER: zuul
+      MYSQL_PASSWORD: secret
+      MYSQL_INITDB_SKIP_TZINFO: 1
+    volumes:
+      - "lib-mysql:/var/lib/mysql"
+    networks:
+      - zuul
+
+  gitserver:
+    build:
+      context: ./gitserver-image
+    volumes:
+      - "./gitserver-repos:/repos:z"
+    networks:
+      - zuul
+
+  scheduler:
+    image: quay.io/zuul-ci/zuul-scheduler:14.2.0
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_started
+    environment:
+      - ZUUL_MYSQL_PASSWORD=secret
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /etc/zuul/wait-for-certs.sh
+        exec zuul-scheduler -f
+    volumes:
+      - "./etc_zuul:/etc/zuul:z"
+      - "certs:/var/certs:z"
+      - "lib-zuul-scheduler:/var/lib/zuul"
+    networks:
+      - zuul
+
+  web:
+    image: quay.io/zuul-ci/zuul-web:14.2.0
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+    ports:
+      - "9000:9000"
+    environment:
+      - ZUUL_MYSQL_PASSWORD=secret
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /etc/zuul/wait-for-certs.sh
+        exec zuul-web -f
+    volumes:
+      - "./etc_zuul:/etc/zuul:z"
+      - "certs:/var/certs:z"
+      - "lib-zuul-web:/var/lib/zuul"
+    networks:
+      - zuul
+
+  executor:
+    image: quay.io/zuul-ci/zuul-executor:14.2.0
+    privileged: true
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
+    environment:
+      - ZUUL_MYSQL_PASSWORD=secret
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        /etc/zuul/wait-for-certs.sh
+        exec zuul-executor -f
+    volumes:
+      - "./etc_zuul:/etc/zuul:z"
+      - "certs:/var/certs:z"
+      - "logs:/srv/static/logs:z"
+      - "lib-zuul-executor:/var/lib/zuul:z"
+    networks:
+      - zuul
+
+  logs:
+    build:
+      context: ./logs-image
+    ports:
+      - "8000:80"
+    volumes:
+      - "logs:/usr/local/apache2/htdocs:z"
+    networks:
+      - zuul
+
+volumes:
+  certs:
+  zk-data:
+  zk-datalog:
+  lib-mysql:
+  lib-zuul-scheduler:
+  lib-zuul-web:
+  lib-zuul-executor:
+  logs:
+
+networks:
+  zuul:

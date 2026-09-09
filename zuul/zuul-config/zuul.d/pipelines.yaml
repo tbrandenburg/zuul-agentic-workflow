@@ -1,0 +1,10 @@
+- pipeline:
+    name: agent-run
+    description: >
+      Executes an agent workflow for a submitted run request pushed to the
+      shared refs/heads/agent-runs branch.
+    manager: independent
+    trigger:
+      agent-git:
+        - event: ref-updated
+          ref: ^refs/heads/agent-runs$
