@@ -1,0 +1,1487 @@
+# Implementation Plan — Zuul Agentic Workflow PoC
+
+Status: **DRAFT — not yet executed.** Nothing in this document has been implemented.
+Last verified against live sources: **2026-09-09**.
+Source of requirements: [docs/INITIAL.md](INITIAL.md).
+
+---
+
+## 0. Executive summary
+
+We will build a local, Git-backed agent pipeline orchestrated by Zuul:
+
+```
+Run API (HTTP) → commit to agent-runs repo → zuul-client enqueue-ref
+  → initialize-agent-run (type: initializer)
+  → planner-agent → coder-agent → tool-validation → reviewer-agent
+  → run-summary artifacts
+```
+
+Each Zuul job is a thin Ansible playbook that shells out to a single Node CLI
+(`agent-runtime`). All agent logic lives in Node. All truth lives in
+deterministic validation, never in a model's self-assessment.
+
+**Six phases plus a Phase 0 confirmation spike**, each ending in a binary,
+independently reproducible acceptance gate. All six open architectural
+questions this plan originally carried are now **resolved by research** — see
+§13. Phase 0 is reduced to confirming those findings against a live stack.
+
+Three hard constraints shape everything below:
+
+1. **No Gerrit, ever.** Enqueue is done with `zuul-client enqueue-ref` against
+   a single `git` driver connection that hosts both the config-project and the
+   untrusted project — **confirmed supported by source inspection** (§13/Q1),
+   no fallback needed.
+2. **Non-mocked Live E2E is a gate at every milestone from Phase 2 onward** —
+   real Zuul, real containers, real model — not just a final demo. §10 defines
+   the tiers; §11 assigns `E2E-0` … `E2E-6`.
+3. **The Zuul web UI is a deliverable.** The run must be legible to a human in
+   the browser, verified by me via Playwright at Phases 1, 5 and 6, with
+   committed screenshots (§11.7).
+
+---
+
+## 1. Research findings that change the original design
+
+This section records what the research actually established, including where
+[docs/INITIAL.md](INITIAL.md) is wrong or under-specified. Every claim below is
+cited.
+
+### 1.1 Versions (verified 2026-09-09)
+
+| Component | Version | Evidence |
+|---|---|---|
+| Zuul | **14.2.0** (2026-04-29) | `https://pypi.org/pypi/zuul/json`; docs version switcher |
+| zuul-client | **14.0.0** (2026-02-26) | `https://pypi.org/project/zuul-client/`; `zuul-client --version` on host |
+| opencode | **1.18.29** | `opencode --version` on host |
+| Node.js | **24.15.0** | `node --version` on host |
+| Docker / Compose | **29.7.2 / v5.5.0** | `docker --version`, `docker compose version` |
+| Ansible | **core 2.16.3** | `ansible --version` on host |
+
+Zuul release cadence is fast (13.0.0 → 14.2.0 in ~8 months). **Pin container
+image tags explicitly** (`quay.io/zuul-ci/zuul-scheduler:14.2.0`), never
+`latest`. The official example compose file uses unpinned images; we deviate
+deliberately.
+
+### 1.2 `type: initializer` is REAL — but the plan's job graph is wrong
+
+INITIAL.md declares `initialize-agent-run` with `type: initializer` and shows it
+as an explicit first node in the graph. Research confirms:
+
+- ✅ `job.type` with value `initializer` **is implemented** since **Zuul 13.1.0**
+  (release notes: *"A new type of job, an 'initializer' job is available… The
+  configuration attribute, `job.type` is available to enable the feature."*).
+  Reference: `https://zuul-ci.org/docs/zuul/latest/config/job.html`.
+- ⚠️ The spec page `developer/specs/init-jobs.html` still carries a **stale**
+  banner claiming the feature is "not currently available in Zuul". Ignore it;
+  `config/job.html` is authoritative.
+- ❗ **Semantics correction:** an initializer job is *"always automatically
+  inserted at the start of the job graph… and acts as a dependency for all other
+  jobs in the graph."* It must therefore **not** be listed in the project
+  stanza's job list, and `planner-agent` must **not** declare a dependency on it.
+  INITIAL.md's implied wiring is redundant at best.
+- ✅ Valid `job.type` values are exactly `regular`, `initializer`, `reporter`.
+  `finalizer` does **not** exist.
+- 💡 An initializer job may return `zuul.child_jobs` to prune the graph. If
+  multiple initializers return `child_jobs`, Zuul runs the **intersection**.
+  This is our mechanism for fail-fast on an invalid run request.
+
+### 1.3 Parent → child state passing is NOT namespaced
+
+INITIAL.md says "dependent jobs use only the returned summary plus artifact
+references". The mechanism is real but sharper than described:
+
+- Data returned via `zuul_return: data: {...}` outside the `zuul:` key becomes
+  **flat Ansible variables** in dependent jobs.
+- ❗ There is **no per-parent-job dictionary** (`zuul.parent_data` does not
+  exist). All parents merge into one global namespace.
+- ❗ Parent job results have the **LOWEST precedence** of any Zuul variable
+  type — below job vars, project vars, extra-vars, etc.
+- ❗ *"If more than one parent job returns the same variable, the value from the
+  later job in the job graph will take precedence."*
+
+**Design consequence:** every returned variable MUST be uniquely prefixed by
+role. We will return a single namespaced object per role:
+
+```yaml
+- zuul_return:
+    data:
+      agent_result_planner:
+        role: planner
+        status: success
+        summary: "..."
+        artifact_url: "https://logs.../planner/agent-result.json"
+        confidence: 0.82
+```
+
+Never a bare `summary:` or `status:`. A collision here is silent and would be a
+very hard bug to find.
+
+### 1.4 Artifact passing via `zuul.artifacts` — RESOLVED (§13/Q2: confirmed NOT populated via `dependencies`)
+
+- `zuul_return` → `zuul.artifacts` is fully documented and stored in the SQL DB,
+  shown in the web UI. Multiple calls **append**.
+- `config/job.html` states dependent jobs are *"provided with artifacts returned
+  by preceding jobs"*, transitively — but only in the `requires`/`provides`
+  mechanism.
+- ✅ **CONFIRMED (§13/Q2):** `zuul.artifacts` is populated **only** via
+  `requires`/`provides` matching, not via plain `job.dependencies`. Only
+  non-`zuul`-namespaced return data is documented as propagated to
+  `dependencies`-linked children.
+
+**Design consequence (defence in depth):** we pass the artifact URL **both**
+ways — as `zuul.artifacts` (for the UI and for future `provides`/`requires`
+work) **and** inside our namespaced `agent_result_<role>` data variable, which
+uses a fully documented mechanism. The runtime reads the namespaced variable.
+Phase 0 includes a spike to determine whether `zuul.artifacts` is in fact
+populated; if it is, we keep both but document the finding.
+
+### 1.5 Semaphore footgun
+
+- `job.semaphore` (singular) is **deprecated**; use `semaphores`.
+- ❗ An **undefined** semaphore name does not error — Zuul silently creates an
+  **implicit semaphore with `max: 1`**. A typo therefore serialises the whole
+  pipeline instead of failing loudly.
+- ❗ `semaphores` **cannot be reduced** by inheritance or override-control; the
+  list only ever extends.
+- Global semaphores are declared in the **tenant config** via
+  `- global-semaphore:` and granted per tenant via `tenant.semaphores`.
+
+**Design consequence:** define `agent-model-concurrency` as a **global
+semaphore** (matching INITIAL.md's intent) and add a startup assertion in the
+Makefile that greps the tenant config for the exact name used in jobs.
+
+### 1.6 `cleanup-run` is deprecated
+
+Use `post-run` with `cleanup: true`. Cleanup playbooks have a **hard-coded
+five-minute timeout**.
+
+### 1.7 Timeouts are phase-scoped
+
+- `timeout` covers **pre-run + run only**.
+- `post-timeout` applies **per post playbook**.
+- `pre-timeout` (Zuul 12.0.0+) bounds pre-run separately.
+- `attempts` (default **3**) retries **only pre-run failures**. Run-phase errors
+  are reported immediately. `zuul_return: zuul: {retry: false}` disables it.
+
+**Design consequence:** the model call happens in the **run** phase, so Zuul's
+`attempts` will **not** retry a flaky model call. Retry logic must live in the
+Node runtime. This is consistent with INITIAL.md's "model-call retry policy in
+the Node runtime" but the reason is now explicit.
+
+### 1.8 Enqueue without a code-review system — RESOLVED
+
+INITIAL.md assumes the Run API can "create a change… then enqueue it". Research
+(final, see §13 for the resolution record):
+
+- ✅ `zuul-client enqueue-ref --tenant T --pipeline P --project X --ref refs/heads/agent-runs --oldrev OLD --newrev NEW`
+  submits a trigger event **with no code-review system**, no change number, no
+  patchset. Documented under "Manual enqueue examples".
+- ✅ `enqueue` (change-based) requires `--change <number>,<patchset>` and
+  therefore requires Gerrit/GitHub/GitLab. **Not used.**
+- ✅ The `git` driver **can** load Zuul configuration from Git repos and **can**
+  trigger on `ref-updated`.
+- ✅ **CONFIRMED (§13/Q1):** the `git` driver **can** host a config-project —
+  `zuul/configloader.py` sets `trusted=True/False` purely from which YAML list a
+  repo appears under; there is no driver-type restriction. Source:
+  `TenantParser.loadTenantProjects`, zuul 14.2.0.
+- ❗ **CONFIRMED BROKEN (§13/Q3):** `enqueue-ref` with `oldrev` = all-zeros
+  (branch-creation marker) **fails** against the git driver for `refs/heads/*` —
+  `git diff 0000...0..<sha>` is not a valid revision range, and the merger job
+  raises, which the scheduler surfaces as `ValueError('Unknown change')`.
+  **Design changed accordingly: see below.**
+- ✅ **CONFIRMED (§13/Q4):** the git driver's poll (`git ls-remote --heads --tags`)
+  is a cheap ref-advertisement query with no clone/fetch. `poll_delay=60` is
+  safe and decoupled from `enqueue-ref` latency.
+- ⚠️ Both `enqueue` and `enqueue-ref` are **privileged** — they require a JWT
+  (§1.9, unaffected by the above).
+
+**Decision: `enqueue-ref` + single `git` driver connection hosting both
+`zuul-config` (config-project) and `agent-runs` (untrusted-project). Gerrit is
+EXCLUDED — hard constraint, permanent, no fallback needed.**
+
+The official quickstart uses Gerrit (~1 GB image, slow start, interactive
+account setup, SSH key provisioning). It is disproportionate for a PoC that
+explicitly performs no code review, and it does not fit this host's 7.3 GB RAM
+alongside the rest of the stack. Gerrit will not be introduced at any phase —
+and, per §13/Q1, it was never actually needed as a fallback in the first place.
+
+**Ref strategy (revised from the original "one ref per run" scheme):** because
+zero-`oldrev` branch creation is broken, the Run API uses a **single, permanent
+branch** `refs/heads/agent-runs`, created once at repo-init time
+(`git commit --allow-empty` + push) and never deleted. Each run appends a commit
+containing `runs/<run_id>/request.json` and fast-forwards that branch, so every
+`enqueue-ref` call uses **real, non-zero** `oldrev`/`newrev`. The initializer
+disambiguates the triggering run via
+`git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}`. Because all
+runs share one branch, the Run API's git-writer **must serialize pushes**
+(tracked as R14, a new required Phase 1 task) to avoid non-fast-forward races
+under concurrent `POST /runs`.
+
+### 1.9 Auth for enqueue — exact configuration
+
+```ini
+[auth zuul_operator]
+driver=HS256
+allow_authz_override=true
+realm=zuul.example.com
+client_id=zuul.example.com
+issuer_id=zuul_operator
+secret=exampleSecret
+```
+
+Mint a token inside the scheduler container:
+
+```bash
+docker compose exec scheduler \
+  zuul-admin create-auth-token \
+    --auth-config zuul_operator \
+    --user run-api \
+    --tenant agents \
+    --expires-in 86400
+```
+
+Notes:
+- Output **includes the literal `Bearer ` prefix** — strip it before passing to
+  `zuul-client --auth-token`.
+- `--auth-config` must match the INI section name exactly. The docs example
+  spells `zuul-operator` (hyphen) while the argparse default is `zuul_operator`
+  (underscore); we standardise on **underscore**.
+- Because `allow_authz_override=true` and the token carries a `zuul.admin`
+  claim for tenant `agents`, **no tenant `admin-rules` are required**. This
+  avoids the deprecated `admin-rules` / `access-rules` keys entirely (they are
+  slated for removal in favour of `tenant.role-mappings`).
+
+### 1.10 Node labels use the new "Nodepool-in-Zuul" model
+
+Zuul 14 replaces standalone Nodepool with `zuul-launcher` and in-repo
+`image` / `flavor` / `label` / `section` / `provider` objects. The official
+example (`zuul-config/zuul.d/providers.yaml`) defines a static node thus:
+
+```yaml
+- image:  {name: ubuntu-jammy, type: cloud}
+- flavor: {name: static}
+- label:  {name: ubuntu-jammy, image: ubuntu-jammy, flavor: static}
+- section:
+    name: static
+    connection: static
+    flavors: [{name: static}]
+- provider:
+    name: static-main
+    section: static
+    nodes:
+      - name: node
+        label: ubuntu-jammy
+        connection-port: 22
+        host-key: "ssh-ed25519 AAAA..."
+    labels: [{name: ubuntu-jammy}]
+    images:
+      - name: ubuntu-jammy
+        python-path: /usr/bin/python3
+        username: root
+```
+
+INITIAL.md's `label: agent-runner` therefore requires a full
+image/flavor/label/section/provider set plus a matching `[connection static]`
+in `zuul.conf` and a `launcher` service in compose. This is **significant
+unstated work**.
+
+**Alternative considered and adopted for Phase 1–2:** run agent jobs as
+**executor-only jobs** (no `nodeset`), which use Ansible's implicit localhost
+and require **no launcher, no static node container, no SSH keys**. Playbooks
+must then use `- hosts: localhost`. We introduce the real `agent-runner` node
+only in Phase 4, when we need a genuinely isolated workspace.
+
+⚠️ Executor-only jobs run **on the Zuul executor**, inside a bubblewrap jail.
+This is acceptable for a local PoC but is explicitly **not** an isolation
+boundary we would ship. Recorded as a known limitation.
+
+### 1.11 `opencode run` output format — VERIFIED BY EXPERIMENT
+
+Ran on this host, 2026-09-09:
+
+```bash
+opencode run --format json --model 'opencode/big-pickle' 'Reply with exactly: PONG'
+```
+
+Exit code `0`. stdout is **NDJSON — one JSON object per line**, not a single
+JSON document:
+
+```
+{"type":"step_start","timestamp":...,"sessionID":"ses_...","part":{...}}
+{"type":"text","timestamp":...,"part":{"type":"text","text":"PONG","time":{...}}}
+{"type":"step_finish","timestamp":...,"part":{"reason":"stop","tokens":{"total":22781,"input":22764,"output":17,"reasoning":0,"cache":{...}},"cost":0}}
+```
+
+Confirmed facts:
+- Assistant text arrives in `type: "text"` events under `part.text`; there may
+  be **multiple** such events which must be **concatenated in order**.
+- `step_finish` carries `part.tokens` and `part.cost` — free telemetry for the
+  run summary.
+- stderr was empty on success; `--print-logs` sends logs to stderr.
+
+Relevant flags confirmed from `opencode run --help`:
+
+| Flag | Use |
+|---|---|
+| `--format json` | NDJSON event stream (**required**) |
+| `-m, --model` | `provider/model`, e.g. `opencode/big-pickle` |
+| `--dir` | run in a specific directory (workspace confinement) |
+| `--agent` | select an agent definition |
+| `--variant` | reasoning effort |
+| `--print-logs`, `--log-level` | diagnostics to stderr |
+| `--pure` | run **without external plugins** |
+| `--auto` | auto-approve permissions — **dangerous, do not use** |
+
+**Design consequences:**
+1. The runtime must parse NDJSON line-by-line and tolerate non-JSON lines.
+2. Use `--pure` to eliminate plugin nondeterminism.
+3. Never use `--auto`.
+4. `opencode` writes session state into the working directory; always pass an
+   explicit `--dir` pointing at the ephemeral workspace.
+
+### 1.12 Logs and artifacts in a local deployment
+
+The official example provides the pattern:
+- executor mounts a shared volume at `/srv/static/logs`;
+- `zuul.conf` sets `[executor] trusted_rw_paths=/srv/static/logs`;
+- a small Apache container (`logs-Dockerfile`) serves that volume on `:8000`;
+- the base job's `post-run` playbook copies logs there and calls
+  `zuul_return` with `zuul.log_url`.
+
+We adopt this verbatim. Artifact URLs returned via `zuul_return` may be
+**relative** — Zuul combines them with `zuul.log_url`. This keeps our playbooks
+free of hardcoded hostnames.
+
+### 1.13 REST API for the Run API's status endpoint
+
+| Purpose | Endpoint |
+|---|---|
+| List buildsets | `GET /api/tenant/{tenant}/buildsets` |
+| **Buildset detail (builds + artifacts)** | `GET /api/tenant/{tenant}/buildset/{uuid}` |
+| List builds | `GET /api/tenant/{tenant}/builds` |
+| Build detail | `GET /api/tenant/{tenant}/build/{uuid}` |
+| Enqueue (REST) | `POST /api/tenant/{tenant}/project/{project}/enqueue` |
+
+`/buildsets` supports `?ref=&newrev=&limit=` — this is how the Run API maps a
+`run_id` back to a buildset. **Revised per §13/Q3:** all runs share the single
+branch `refs/heads/agent-runs`; the Run API queries by the **`newrev`** of the
+commit it just pushed for that run (recorded at push time), not by a per-run
+ref name.
+
+⚠️ The REST `enqueue` body schema documents only
+`{pipeline, ref, oldrev, newrev, parameters}`. We use the `zuul-client` CLI
+rather than raw REST, because its behaviour is documented and stable.
+
+---
+
+## 2. Architecture
+
+### 2.1 Component diagram
+
+```mermaid
+flowchart LR
+  U["Caller (curl / CI)"] -->|POST /runs| API["run-api (Fastify)"]
+  API -->|commit + push| AR[("agent-runs<br/>bare git repo")]
+  API -->|zuul-client enqueue-ref| SCHED["zuul-scheduler"]
+  SCHED --> EXEC["zuul-executor"]
+  EXEC -->|ansible| RT["agent-runtime (Node CLI)"]
+  RT -->|opencode run --format json| OC["opencode + model"]
+  EXEC -->|copy| LOGS[("/srv/static/logs")]
+  LOGS --> HTTPD["log server :8000"]
+  API -->|GET /api/tenant/agents/buildsets?ref=...| WEB["zuul-web :9000"]
+  U -->|GET /runs/:id| API
+```
+
+### 2.2 Job graph (corrected)
+
+```mermaid
+flowchart TD
+  I["initialize-agent-run<br/>(type: initializer — auto-inserted)"]
+  I --> P["planner-agent"]
+  P --> C["coder-agent"]
+  C --> V["tool-validation"]
+  V --> R["reviewer-agent"]
+  R --> S["publish-run-summary"]
+```
+
+The initializer is **not** listed in the project stanza. It validates the run
+request and may emit `zuul.child_jobs: []` to skip everything downstream.
+
+### 2.3 Trust boundaries
+
+| Zone | Contents | Trust |
+|---|---|---|
+| Config project `zuul-config` | pipelines, providers, base job, job defs | **Trusted** |
+| Untrusted project `agent-runs` | run-request commits | **Untrusted data** |
+| Model output | prompts, stdout, patches, summaries | **Hostile until validated** |
+| `tool-validation` | schema, patch apply, allowlist, lint, tests, secret scan | **Sole source of truth** |
+
+Rule: **the reviewer's verdict is advisory and never gates progression** in this
+PoC.
+
+---
+
+## 3. Repository layout (final)
+
+```
+.
+├── Makefile                          # see §11.8 for the full target list
+├── package.json                      # npm workspaces root
+├── tsconfig.base.json
+├── apps/
+│   └── run-api/
+│       ├── src/{server,routes,git-writer,zuul-client,status}.ts
+│       └── test/
+├── packages/
+│   ├── agent-contracts/              # schemas + generated TS types
+│   │   ├── schemas/*.json            # single source of truth
+│   │   └── src/index.ts
+│   ├── agent-runtime/
+│   │   └── src/{cli,input,prompt,opencode,normalize,retry,redact}.ts
+│   └── agent-tools/
+│       └── src/{patch,allowlist,lint,test,secrets,summary}.ts
+├── prompts/{planner,coder,reviewer}.md
+├── schemas/                          # symlink → packages/agent-contracts/schemas
+├── sandbox/
+│   └── services/example/             # target repo the coder patches
+├── zuul/
+│   ├── docker-compose.yaml
+│   ├── etc_zuul/{zuul.conf,main.yaml}
+│   ├── zuul-config/zuul.d/{pipelines,providers,jobs,projects}.yaml
+│   ├── jobs/agent-jobs.yaml
+│   └── playbooks/
+│       ├── base/{pre,post-logs,cleanup}.yaml
+│       ├── init-run.yaml
+│       ├── run-agent.yaml
+│       ├── validate-result.yaml
+│       └── publish-summary.yaml
+├── .playwright-mcp/                  # committed UI evidence screenshots
+└── docs/{INITIAL.md,PLAN.md,poc.md,RUNBOOK.md}
+```
+
+`schemas/` at the root (as INITIAL.md specifies) is a **symlink** into
+`agent-contracts` so there is exactly one source of truth. DRY over layout
+fidelity.
+
+---
+
+## 4. Contracts
+
+Schemas are **JSON Schema draft 2020-12**, validated with **Ajv** using the
+`ajv/dist/2020` entry point. TypeScript types are **generated** from the
+schemas (`json-schema-to-typescript`) — never hand-written in parallel.
+
+### 4.1 `task-request.schema.json`
+
+```jsonc
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/task-request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "repo", "base_ref"],
+  "properties": {
+    "task":   { "type": "string", "minLength": 8, "maxLength": 4000 },
+    "repo":   { "type": "string", "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$" },
+    "base_ref": { "type": "string", "pattern": "^[A-Za-z0-9._/-]{1,128}$" },
+    "model":  { "type": "string", "pattern": "^[a-z0-9-]+/[a-z0-9._-]+$" },
+    "allowed_paths": {
+      "type": "array", "items": { "type": "string" },
+      "maxItems": 64, "default": []
+    }
+  }
+}
+```
+
+`run_id` and `requested_at` are **server-assigned**, never client-supplied.
+`run_id` is a **ULID** (lexicographically sortable, matches INITIAL.md's `01...`
+example).
+
+### 4.2 `agent-input.schema.json`
+
+```jsonc
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/agent-input.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","run_id","role","task","workspace","model"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+    "role":   { "enum": ["planner","coder","reviewer"] },
+    "task": {
+      "type": "object", "additionalProperties": false,
+      "required": ["description","repo","base_ref"],
+      "properties": {
+        "description": { "type": "string" },
+        "repo":        { "type": "string" },
+        "base_ref":    { "type": "string" },
+        "base_sha":    { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+      }
+    },
+    "upstream_results": {
+      "type": "array", "default": [],
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["role","summary"],
+        "properties": {
+          "role":         { "enum": ["planner","coder","reviewer","validation"] },
+          "summary":      { "type": "string", "maxLength": 8000 },
+          "artifact_url": { "type": "string", "format": "uri" },
+          "status":       { "enum": ["success","failure","error"] }
+        }
+      }
+    },
+    "validation": { "type": ["object","null"], "default": null },
+    "workspace": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path","mode"],
+      "properties": {
+        "path": { "type": "string" },
+        "mode": { "enum": ["read-only","read-write"] }
+      }
+    },
+    "model": { "type": "string" },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "timeout_ms":       { "type": "integer", "default": 900000 },
+        "max_output_bytes": { "type": "integer", "default": 1048576 },
+        "max_attempts":     { "type": "integer", "default": 3 }
+      }
+    }
+  }
+}
+```
+
+Note the additions over INITIAL.md: `schema_version`, `base_sha` (pins the
+revision the patch must apply to — required for deterministic validation),
+`validation` (feeds the reviewer), and `limits`.
+
+### 4.3 `agent-result.schema.json`
+
+```jsonc
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zuul-agentic/agent-result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version","run_id","agent","status","summary"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id":  { "type": "string" },
+    "agent":   { "enum": ["planner","coder","reviewer"] },
+    "status":  { "enum": ["success","failure","error"] },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 8000 },
+    "claims": {
+      "type": "array", "default": [],
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["statement","verifiable"],
+        "properties": {
+          "statement":  { "type": "string" },
+          "verifiable": { "type": "boolean" },
+          "evidence":   { "type": "string" }
+        }
+      }
+    },
+    "files":        { "type": "array", "items": { "type": "string" }, "default": [] },
+    "next_actions": { "type": "array", "items": { "type": "string" }, "default": [] },
+    "confidence":   { "type": "number", "minimum": 0, "maximum": 1 },
+    "state_uri":    { "type": "string" },
+    "telemetry": {
+      "type": "object",
+      "properties": {
+        "model":        { "type": "string" },
+        "attempts":     { "type": "integer" },
+        "duration_ms":  { "type": "integer" },
+        "tokens_input": { "type": "integer" },
+        "tokens_output":{ "type": "integer" },
+        "cost":         { "type": "number" }
+      }
+    }
+  }
+}
+```
+
+`telemetry` is populated from the `step_finish` NDJSON event — free, verified
+data. `claims[].verifiable` forces the model to distinguish assertions it can
+back with evidence from ones it cannot; `tool-validation` cross-checks these.
+
+### 4.4 `run-summary.schema.json` (new — INITIAL.md names the file but omits it)
+
+Aggregates: run request, per-role results, validation report, buildset UUID,
+build URLs, artifact URLs, final verdict, total cost/tokens.
+
+---
+
+## 5. Node runtime design
+
+### 5.1 Stack
+
+| Concern | Choice | Rationale |
+|---|---|---|
+| Package layout | npm **workspaces** | built in to npm 11; no extra tool (KISS) |
+| Language | **TypeScript**, strict, `noUncheckedIndexedAccess` | AGENTS.md forbids `any` |
+| Validation | **Ajv** (2020-12 build) | de-facto standard, fastest |
+| Types | `json-schema-to-typescript` | schemas stay single source of truth |
+| HTTP | **Fastify** | schema-first, built-in JSON Schema validation |
+| Tests | **Vitest** | fast, native TS/ESM |
+| Subprocess | `node:child_process.spawn` | zero deps; `execa` adds nothing we need |
+| Logging | structured JSON to stderr | keeps stdout clean for machine output |
+
+Exact minor versions are pinned by `package-lock.json` at install time; this
+document deliberately does not fabricate version numbers it has not verified.
+
+### 5.2 CLI contract (as specified in INITIAL.md)
+
+```bash
+agent-runtime run \
+  --role planner \
+  --input  /tmp/agent-input.json \
+  --output /tmp/agent-result.json \
+  --prompt prompts/planner.md \
+  --model  "${AGENT_MODEL}" \
+  [--mock] [--workspace /workspace] [--artifacts /tmp/artifacts]
+```
+
+Exit codes — **explicit and bounded**, per AGENTS.md:
+
+| Code | Meaning |
+|---|---|
+| `0` | success; valid result written |
+| `10` | input manifest failed schema validation |
+| `11` | prompt file missing/unreadable |
+| `20` | model invocation failed after all retries |
+| `21` | model call exceeded timeout |
+| `22` | model output exceeded size cap |
+| `30` | model output could not be normalised into a valid result (**fail closed**) |
+| `40` | workspace violation (write attempted outside allowed root) |
+
+### 5.3 Execution pipeline
+
+1. **Load & validate input** against `agent-input.schema.json` → exit `10`.
+2. **Compose prompt**: role template + task + upstream summaries + validation
+   report + a strict *"emit a single fenced ```json block matching this
+   schema"* instruction. The result schema is **embedded in the prompt**.
+3. **Invoke opencode**:
+   ```
+   opencode run --format json --pure --model <model> --dir <workspace> <prompt>
+   ```
+   - prompt passed via argv (or a temp file for large prompts);
+   - stdout and stderr captured **separately** into distinct buffers;
+   - hard `timeout_ms` via `AbortController`, then `SIGTERM` → `SIGKILL`;
+   - byte counter aborts at `max_output_bytes` → exit `22`.
+4. **Parse NDJSON**: split on newlines, `JSON.parse` each, ignore unparseable
+   lines (recording a warning), concatenate `part.text` from `type: "text"`
+   events in order, extract `part.tokens`/`part.cost` from `step_finish`.
+5. **Normalise**: extract the last fenced ```json block; parse; fill defaults;
+   validate against `agent-result.schema.json`. Failure → **exit 30, no partial
+   result written**.
+6. **Retry policy**: retry only on transport/timeout/malformed-output classes,
+   `max_attempts` (default 3), exponential backoff with jitter
+   (1s, 2s, 4s ±20%). Each attempt logged with its own telemetry. Never retry
+   a schema-valid `status: failure` — that is a real answer.
+7. **Redact**: apply secret patterns to result, stdout log, and stderr log
+   before writing.
+8. **Write atomically**: write to `<output>.tmp`, `fsync`, `rename`.
+
+### 5.4 Mock mode
+
+`--mock` short-circuits step 3, replaying a fixture keyed by role from
+`packages/agent-runtime/fixtures/`. Fixtures deliberately include:
+`valid`, `malformed-json`, `missing-required-field`, `empty-output`,
+`oversized-output`, `timeout`, `nonzero-exit`.
+
+This makes the entire Zuul pipeline runnable **with zero model cost** — essential
+for iterating on Ansible and for CI.
+
+### 5.5 Workspace confinement
+
+- `--dir` restricts opencode's working directory.
+- After the run, the runtime **diffs the workspace against `base_sha`** and
+  rejects any change touching a path outside `allowed_paths` → exit `40`.
+- The runtime never invokes `git push`, and no push credentials exist in the
+  job environment (Definition of Done: *"no target-repo write occurs"*).
+
+---
+
+## 6. Deterministic validation (`agent-tools`)
+
+`tool-validation` is a **regular job** running `validate-result.yaml`, which
+invokes `agent-tools validate`. Ordered, fail-fast checks:
+
+| # | Check | Failure = |
+|---|---|---|
+| 1 | Every `agent-result.json` validates against schema | FAILURE |
+| 2 | `patch.diff` is non-empty and parses as a unified diff | FAILURE |
+| 3 | `git apply --check` against the recorded `base_sha` | FAILURE |
+| 4 | Changed-file allowlist (from `allowed_paths` + repo default) | FAILURE |
+| 5 | Forbidden paths (`.git/`, `**/*.pem`, `**/.env*`, CI config, `zuul/`) | FAILURE |
+| 6 | Secret scan (regex set) over patch **and** all artifacts | FAILURE |
+| 7 | Formatter/linter on the patched tree | FAILURE |
+| 8 | Focused test command on the patched tree | FAILURE |
+| 9 | Cross-check `claims[].verifiable == true` against evidence | WARNING |
+
+Output: `validation-report.json` (machine) + `validation-report.md` (human),
+both published as artifacts and both fed to the reviewer.
+
+Critically: **step 3 applies the patch to a throwaway clone inside the job
+workspace.** The sandbox target repo (`sandbox/services/example`) is never
+mutated in place.
+
+---
+
+## 7. Zuul configuration
+
+### 7.1 Compose services (pinned)
+
+| Service | Image | Port | Notes |
+|---|---|---|---|
+| `zk` | `quay.io/opendevmirror/zookeeper` | — | TLS certs via init playbook |
+| `mysql` | `quay.io/opendevmirror/mariadb` | — | build/artifact history |
+| `scheduler` | `quay.io/zuul-ci/zuul-scheduler:14.2.0` | — | |
+| `web` | `quay.io/zuul-ci/zuul-web:14.2.0` | `9000` | REST API + UI |
+| `executor` | `quay.io/zuul-ci/zuul-executor:14.2.0` | — | `privileged: true` |
+| `logs` | local Apache build | `8000` | serves `/srv/static/logs` |
+| `gitserver` | `nginx` + `git-http-backend` | `8081` | hosts `agent-runs` + `zuul-config` |
+| `launcher` | `quay.io/zuul-ci/zuul-launcher:14.2.0` | — | **Phase 4 only** |
+
+**Gerrit is never present, in any phase.** `node` and `launcher` are additionally
+omitted in Phases 0–3 — a deliberate simplification enabled by executor-only
+jobs (§1.10) and `enqueue-ref` (§1.8).
+
+Resource note: the host has 7.3 GB RAM (≈4.8 GB available). ZooKeeper + MariaDB
++ 3 Zuul services + nginx + Apache is comfortable; Gerrit would not be. The
+Gerrit-free design is both an architectural and a capacity decision.
+
+The Zuul **web UI is a first-class deliverable**, not incidental: `web` on
+`:9000` is how a human inspects the buildset, the job graph, per-build console
+output and the artifact list. §7.7 and §11.7 cover its configuration and
+verification.
+
+### 7.2 `zuul.conf` (deltas from the official example)
+
+```ini
+[scheduler]
+tenant_config=/etc/zuul/main.yaml
+
+[connection agent-git]
+driver=git
+baseurl=http://gitserver/git
+poll_delay=60
+
+[executor]
+trusted_rw_paths=/srv/static/logs
+# Pass the model name through to job environments
+variables=/etc/zuul/site-variables.yaml
+
+[auth zuul_operator]
+driver=HS256
+allow_authz_override=true
+realm=zuul.local
+client_id=zuul.local
+issuer_id=zuul_operator
+secret=${ZUUL_AUTH_SECRET}
+```
+
+`AGENT_MODEL` is supplied as a **site variable**, not baked into job definitions
+— satisfying INITIAL.md's *"The model name is configuration, not hardcoded into
+job definitions."*
+
+### 7.3 `main.yaml` (tenant)
+
+```yaml
+- global-semaphore:
+    name: agent-model-concurrency
+    max: 2
+
+- tenant:
+    name: agents
+    semaphores:
+      - agent-model-concurrency
+    source:
+      agent-git:
+        config-projects:
+          - zuul-config          # ⚠ Phase 0 must confirm git-driver config-projects
+        untrusted-projects:
+          - agent-runs
+```
+
+### 7.4 Pipeline
+
+```yaml
+- pipeline:
+    name: agent-run
+    description: Executes an agent workflow for a submitted run request.
+    manager: independent
+    trigger:
+      agent-git:
+        - event: ref-updated
+          ref: ^refs/heads/agent-runs$
+```
+
+`independent` because runs are unrelated to each other and must not queue behind
+one another. Concurrency is bounded by the semaphore, not the pipeline. The
+trigger matches the **single shared branch** (§1.8/§13-Q3); the initializer job
+identifies which run's commit fired the event via `zuul.newrev`.
+
+### 7.5 Jobs (corrected from INITIAL.md)
+
+```yaml
+- job:
+    name: agent
+    abstract: true
+    timeout: 1800
+    pre-timeout: 300
+    post-timeout: 300
+    attempts: 1                     # model retries live in the Node runtime
+    run: zuul/playbooks/run-agent.yaml
+    semaphores:
+      - name: agent-model-concurrency
+    vars:
+      agent_input_path:  /tmp/agent-input.json
+      agent_output_path: /tmp/agent-result.json
+      agent_artifacts_dir: "{{ zuul.executor.log_root }}/artifacts"
+
+- job:
+    name: initialize-agent-run
+    type: initializer                       # auto-inserted; NOT listed in project
+    run: zuul/playbooks/init-run.yaml
+
+- job: {name: planner-agent,  parent: agent, vars: {agent_role: planner,  prompt_file: prompts/planner.md}}
+- job: {name: coder-agent,    parent: agent, vars: {agent_role: coder,    prompt_file: prompts/coder.md}}
+- job: {name: reviewer-agent, parent: agent, vars: {agent_role: reviewer, prompt_file: prompts/reviewer.md}}
+
+- job:
+    name: tool-validation
+    timeout: 900
+    run: zuul/playbooks/validate-result.yaml
+
+- job:
+    name: publish-run-summary
+    timeout: 300
+    run: zuul/playbooks/publish-summary.yaml
+
+- project:
+    name: agent-runs
+    agent-run:
+      jobs:
+        - planner-agent
+        - coder-agent:      {dependencies: [planner-agent]}
+        - tool-validation:  {dependencies: [coder-agent]}
+        - reviewer-agent:   {dependencies: [tool-validation]}
+        - publish-run-summary:
+            dependencies:
+              - name: reviewer-agent
+                soft: true          # still summarise when the reviewer is skipped
+```
+
+Differences from INITIAL.md, and why:
+- `initialize-agent-run` removed from the project job list (§1.2).
+- `attempts: 1` added — Zuul's retry does not cover the run phase (§1.7).
+- `semaphores` (plural) on the abstract job, referencing the **global**
+  semaphore (§1.5).
+- `nodeset` omitted → executor-only (§1.10); reinstated in Phase 4.
+- `publish-run-summary` added so the caller always gets a summary, using a
+  **soft** dependency so it survives an upstream skip.
+
+### 7.6 `run-agent.yaml` (shape)
+
+```yaml
+- hosts: localhost
+  tasks:
+    - name: Build agent input manifest
+      # merges zuul vars + namespaced agent_result_* from upstream jobs
+    - name: Run agent-runtime
+      command: agent-runtime run --role {{ agent_role }} ...
+      register: agent_run
+      failed_when: agent_run.rc not in [0]
+    - name: Validate result against schema (independent of the runtime)
+      command: agent-tools check-schema --file {{ agent_output_path }}
+    - name: Publish artifacts and return compact summary
+      zuul_return:
+        data:
+          "agent_result_{{ agent_role }}":
+            role: "{{ agent_role }}"
+            status: "..."
+            summary: "..."
+            artifact_url: "artifacts/{{ agent_role }}/agent-result.json"
+          zuul:
+            artifacts:
+              - name: "{{ agent_role }} result"
+                url: "artifacts/{{ agent_role }}/agent-result.json"
+```
+
+Schema validation is deliberately run **twice** — once inside the runtime, once
+in the playbook by a separate tool. The playbook check is what INITIAL.md
+requires ("the Zuul playbook validates it against the JSON schema") and it
+guards against a runtime bug writing a bad file.
+
+### 7.7 Zuul web UI
+
+The web UI is the human-facing evidence surface for the whole PoC. It must show
+the agent workflow as a real, inspectable Zuul buildset — not just an API blob.
+
+**Configuration requirements**
+
+```ini
+[web]
+listen_address=0.0.0.0
+port=9000
+root=http://localhost:9000
+```
+
+- `root` **must** match the URL the browser uses, or the SPA generates broken
+  links and the API base path is wrong. `http://localhost:9000` for local use.
+- The `[database]` section is **mandatory for the UI to show build history**.
+  Without MariaDB, `/builds` and `/buildsets` are empty and artifacts are
+  invisible. This is why `mysql` is in the compose stack from Phase 0.
+- `zuul_return` with `zuul.log_url` is what makes the **Logs** and **Artifacts**
+  tabs populate. A build with no `log_url` renders as a dead end.
+- Artifacts returned via `zuul.artifacts` appear in the buildset's **Artifacts**
+  listing with their `name` and `metadata`.
+
+**Pages that must be demonstrably working**
+
+| Route | Must show |
+|---|---|
+| `/t/agents/status` | live pipeline with the queued/running run |
+| `/t/agents/buildsets` | one row per run, result column |
+| `/t/agents/buildset/<uuid>` | **job graph**, all 6 builds, per-job result |
+| `/t/agents/build/<uuid>` | console output, log files, artifacts |
+| `/t/agents/jobs` | the abstract `agent` job and its 3 variants |
+
+**Anonymous read access:** no authentication is required for read-only browsing.
+Auth (§1.9) is needed only for `enqueue`. The UI must therefore be usable with
+no login — verified in §11.7.
+
+
+---
+
+## 8. Run API
+
+**Revised per §13/Q3:** all runs are committed to the single permanent branch
+`refs/heads/agent-runs` (never a per-run branch — zero-`oldrev` branch creation
+is confirmed broken against the git driver, see §1.8). A serializing
+`git-writer` module owns all pushes to this branch.
+
+| Method | Path | Behaviour |
+|---|---|---|
+| `POST` | `/runs` | validate → assign ULID + timestamp → **acquire push lock** → clone shallow, append `runs/<id>/request.json`, commit, record `oldrev`/`newrev` → push to `agent-runs` (fast-forward only) → **release lock** → `zuul-client enqueue-ref --ref refs/heads/agent-runs --oldrev <oldrev> --newrev <newrev>` → `202` + `{run_id, newrev, status_url}` |
+| `GET` | `/runs/:id` | `GET /api/tenant/agents/buildsets?ref=refs/heads/agent-runs&newrev=<newrev for this run_id>` → map to `{status, buildset_uuid, builds[], artifacts[]}` |
+| `GET` | `/runs/:id/summary` | proxy `run-summary.json` artifact |
+| `GET` | `/healthz` | liveness |
+
+Details:
+- The Run API persists a small local index (`run_id → newrev`) so `GET /runs/:id`
+  can resolve the buildset without re-deriving it from git history each time.
+- Pushes are **serialized** by an in-process mutex (single Run API instance for
+  the PoC); a real deployment would need a distributed lock, out of scope here.
+- On a push rejection (non-fast-forward, e.g. a race), the Run API retries
+  the clone-append-commit-push cycle up to 3 times before returning `503`.
+- `oldrev`/`newrev` are always **real, non-zero SHAs** — never the all-zeros
+  branch-creation marker (§1.8).
+- The JWT is read from `ZUUL_AUTH_TOKEN` (env), never logged, never returned.
+- Request body validated by Fastify against `task-request.schema.json`.
+- Rate limit + max body size to bound abuse.
+
+---
+
+## 9. Security controls
+
+| Control | Implementation |
+|---|---|
+| No repo-write creds | Job env contains no SSH key or token for target repos; runtime never pushes |
+| Workspace confinement | `opencode --dir`; post-run diff vs `base_sha`; exit `40` on violation |
+| Untrusted model output | Never `eval`'d, never shell-interpolated; patches only applied via `git apply --check` in a throwaway clone |
+| No arbitrary shell | Tool allowlist in `agent-tools`; model output selects *which* allowlisted tool, never *what command* |
+| Secret redaction | Regex set applied to result, stdout, stderr, patch, summary before publishing; plus `zuul_return: zuul.redactions` |
+| Concurrency cap | Global semaphore `agent-model-concurrency`, `max: 2` |
+| Timeouts | Node `timeout_ms` (900s) < job `timeout` (1800s) — inner bound fires first |
+| Output caps | `max_output_bytes` (1 MiB) → exit `22` |
+| Prompt-injection posture | Model output cannot alter validation; validation config lives in the **trusted config-project** |
+| No `--auto` | Never pass opencode's auto-approve flag |
+| Plugin determinism | Always `--pure` |
+
+**Explicit residual risk:** Phase 1–3 executor-only jobs run inside the
+executor's bubblewrap jail, not a dedicated node. Documented, accepted for a
+local PoC, remediated in Phase 4.
+
+---
+
+## 10. Testing strategy (50/30/20)
+
+**Unit (50%)** — Vitest, no Zuul, no model:
+NDJSON parsing (multi-`text`, interleaved, malformed lines); fenced-block
+extraction (none / multiple / trailing prose); schema validation happy + every
+failure mode; retry backoff & attempt caps; timeout kill path; output-size cap;
+redaction; ULID generation; allowlist and forbidden-path matching; patch parse
+and `git apply --check` against a fixture repo.
+
+**Integration (30%)** — real processes, no Zuul:
+`agent-runtime --mock` end-to-end for all seven fixtures asserting exact exit
+codes; `agent-tools validate` against good/bad patch fixtures; run-api against a
+**real local bare git repo** and a **stubbed** zuul-client binary, asserting the
+commit lands on the right ref with the right content.
+
+**E2E (20%) — real Zuul, real containers, real model, NO MOCKS ANYWHERE.**
+
+Terminology is fixed for the rest of this document to stop "E2E" being diluted:
+
+| Term | Definition |
+|---|---|
+| **Piped E2E** | Real Zuul + containers, `agent-runtime --mock`. Deterministic, zero model cost. CI-safe. **Not** an E2E test — it is an integration test of the orchestration layer. |
+| **Live E2E** | Real Zuul + containers + **real `opencode run` against `opencode/big-pickle`**. No mock, no stub, no fixture anywhere in the path. |
+
+Per AGENTS.md ("Never mock something in E2E tests"), only **Live E2E** counts as
+E2E. Piped E2E is a development convenience and is classified under Integration.
+
+**Live E2E is a gate at every milestone from Phase 2 onward, not only at the
+end.** Each is numbered `E2E-<phase>` and must be re-runnable via a single make
+target. Nondeterminism is handled by asserting on **structure and invariants**,
+never on model prose:
+
+- assert `status` ∈ enum, `summary` non-empty, schema validates
+- assert artifact exists, is non-empty, and is fetchable over HTTP
+- assert job results and graph order
+- assert cost/token telemetry present and > 0 (proves a real model call)
+- **never** assert specific model wording
+
+Live E2E tests are marked flaky-tolerant with **at most one automatic retry**,
+and every run records its telemetry so a failure can be distinguished from a
+model hiccup.
+
+| ID | Phase | Scope |
+|---|---|---|
+| `E2E-0` | 0 | `enqueue-ref` → buildset → executor-only job SUCCESS |
+| `E2E-2` | 2 | Real `opencode run` produces a schema-valid result outside Zuul |
+| `E2E-3` | 3 | Real planner → real coder inside Zuul, state passed |
+| `E2E-4` | 4 | Real coder patch survives all 9 deterministic checks |
+| `E2E-5` | 5 | `POST /runs` → full 6-job buildset → `run-summary.json` |
+| `E2E-6` | 6 | All six failure scenarios + UI verification |
+
+**Anti-cheat rules:** no test asserts only that a mock was called. Every test
+that claims a file was produced reads it back and validates it. A Live E2E test
+that cannot prove a real model call occurred (via telemetry) is a **failing**
+test. Coverage is not a goal; finding real bugs is.
+
+
+---
+
+## 11. Phased delivery
+
+Each phase has a **binary** acceptance gate. Nothing advances on a partial pass.
+
+### Phase 0 — Infrastructure spike (timebox: 1 day)
+
+All architectural questions this phase existed to de-risk are now **resolved**
+by research (§13). Phase 0 is reduced from open-ended investigation to a
+**confirmation smoke test** of already-decided behaviour, plus the one thing
+that genuinely requires running containers to observe (initializer + web UI).
+
+| # | Task |
+|---|---|
+| 0.1 | Bring up ZK + MariaDB + scheduler + web + executor + logs + gitserver, images pinned to 14.2.0 |
+| 0.2 | Host `zuul-config` (config-project) and `agent-runs` (untrusted) on a **single** git driver connection (§13/Q1: confirmed supported, no second connection needed) |
+| 0.3 | **Confirmation only:** verify the scheduler actually loads a `pipeline:`/`job:` from the git-driver config-project (closes the loop on §13/Q1's source-code finding with a live check) |
+| 0.4 | Seed the permanent `refs/heads/agent-runs` branch (`git commit --allow-empty` + push); mint a JWT; run `zuul-client enqueue-ref` with **real, non-zero** `oldrev`/`newrev` (§13/Q3) into an `independent` pipeline; confirm a buildset is created |
+| 0.5 | Run a trivial `noop`-style **executor-only** job; confirm it succeeds with no launcher and no node |
+
+**Gate `E2E-0` (non-mocked):** `zuul-client enqueue-ref` produces a buildset that
+runs an executor-only job to SUCCESS, verified by
+`GET /api/tenant/agents/buildsets` **and** by the build appearing in the web UI
+at `/t/agents/buildsets`. No stubs anywhere.
+
+**No Gerrit-free fallback ladder is carried forward** — §13/Q1 confirmed the
+single-connection design works from source inspection; 0.3 exists only to
+verify that finding empirically once, not to explore alternatives.
+
+### Phase 1 — Zuul baseline + initializer
+
+| # | Task |
+|---|---|
+| 1.1 | `agent-run` pipeline; base job with `pre`/`post-logs`/`cleanup` playbooks |
+| 1.2 | Log volume + Apache log server; `zuul.log_url` returned by the base job |
+| 1.3 | `initialize-agent-run` as `type: initializer`: identifies the triggering run via `git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}` (§13/Q3), reads that `runs/<id>/request.json`, validates against `task-request.schema.json`, publishes `run-request.json` as an artifact |
+| 1.4 | Initializer emits `zuul.child_jobs: []` on an invalid request |
+| 1.5 | Global semaphore `agent-model-concurrency` (`max: 2`) + Makefile assertion that the name matches between tenant config and job config |
+| 1.6 | Verify the web UI renders the buildset and its artifact link (manual, §11.7); no `access-rules`/`admin-rules` configured, relying on the confirmed anonymous-read default (§13/Q6) |
+| 1.7 | **(R14, new)** Run API `git-writer`: serializing push mutex to the shared `refs/heads/agent-runs` branch, with retry-on-non-fast-forward |
+
+**Gate:** a manually enqueued ref runs the initializer, publishes an artifact
+reachable over HTTP, and a deliberately malformed request skips all downstream
+jobs. The artifact is reachable **by clicking through the web UI**, not only by
+`curl`.
+
+### Phase 2 — Contracts and runner
+
+| # | Task |
+|---|---|
+| 2.1 | npm workspaces, TS strict, Vitest, Makefile targets |
+| 2.2 | All four schemas + generated TS types |
+| 2.3 | `agent-runtime` CLI: input load/validate, prompt compose, opencode adapter, NDJSON parser, normaliser, retry, redaction, atomic write |
+| 2.4 | `--mock` mode + seven fixtures |
+| 2.5 | Unit + integration tests for every exit code |
+| 2.6 | Three prompt templates with embedded result schema and explicit output contract |
+| 2.7 | `make e2e-2` — Live E2E harness invoking the real model |
+
+**Gate:** `make test` green; every documented exit code demonstrated by a test.
+
+**Gate `E2E-2` (non-mocked):** `agent-runtime run --role planner` against the
+**real** `opencode/big-pickle` — no `--mock`, no fixture — writes an
+`agent-result.json` that validates against the schema, with
+`telemetry.tokens_input > 0` and `telemetry.duration_ms > 0` proving a genuine
+model call.
+
+### Phase 3 — Planner → coder state passing
+
+| # | Task |
+|---|---|
+| 3.1 | `run-agent.yaml` building the input manifest from Zuul vars + upstream `agent_result_*` |
+| 3.2 | `planner-agent` returns namespaced compact data + artifacts |
+| 3.3 | `coder-agent` consumes **only** `agent_result_planner` + fetched artifact |
+| 3.4 | Independent playbook-side schema check |
+| 3.5 | Assert the coder never reads raw planner stdout (test: corrupt the stdout log, run must still pass) |
+| 3.6 | `make e2e-3` — Live E2E for the two-job chain |
+
+**Gate:** two-job chain succeeds with `--mock` (fast inner loop); coder's input
+manifest provably contains the planner's summary and artifact URL and nothing
+else.
+
+**Gate `E2E-3` (non-mocked):** the same two-job chain runs inside Zuul with the
+**real** model in both jobs. Assertions: both builds SUCCESS; both results
+schema-valid; both carry non-zero telemetry; the coder's captured input manifest
+contains a `upstream_results[0].summary` that is byte-identical to the planner's
+returned summary. Proves real cross-job state transfer, not a fixture.
+
+### Phase 4 — Patch generation and deterministic validation
+
+| # | Task |
+|---|---|
+| 4.1 | `sandbox/services/example` with lint + a fast test suite |
+| 4.2 | Coder produces `artifacts/patch.diff` against the pinned `base_sha` |
+| 4.3 | `agent-tools validate`: all nine checks |
+| 4.4 | `tool-validation` job; report published as JSON + Markdown |
+| 4.5 | Introduce the real `agent-runner` node: `launcher` service, `[connection static]`, image/flavor/label/section/provider, node container, SSH keys |
+| 4.6 | Move agent jobs onto the `agent-runner` nodeset |
+| 4.7 | Prove the target repo is byte-identical before and after a run |
+| 4.8 | `make e2e-4` — Live E2E producing a real model-authored patch |
+
+**Gate:** a mock coder patch passes all nine checks; a deliberately bad patch
+fails at the correct check with a precise message; `git status` in the sandbox
+repo is clean after every run.
+
+**Gate `E2E-4` (non-mocked):** the **real** model is given a genuine task
+against `sandbox/services/example` and produces a `patch.diff` that
+`git apply --check` accepts at the pinned `base_sha` and that passes lint and
+the sandbox test suite. Assertions are structural (patch parses, applies,
+touches only allowlisted paths, tests pass) — never on the patch's content.
+
+⚠️ Honest risk: a model may produce a non-applying patch on any given run. This
+gate therefore permits **one retry**, and if it still fails, that is a genuine
+finding about prompt quality to fix in Phase 4 — **not** a reason to weaken the
+gate or fall back to a fixture.
+
+### Phase 5 — Review and run summary
+
+| # | Task |
+|---|---|
+| 5.1 | Reviewer receives `validation-report.json` + all upstream summaries |
+| 5.2 | Reviewer verdict recorded but **non-gating** (assert: failing review still yields SUCCESS) |
+| 5.3 | `publish-run-summary` emits `run-summary.json` + `run-summary.md` |
+| 5.4 | Run API `GET /runs/:id` and `/runs/:id/summary` backed by the REST API |
+| 5.5 | Artifact bundle: request, three results, patch, validation report, prompts, logs, telemetry |
+| 5.6 | `make e2e-5` — Live E2E for the complete pipeline |
+
+**Gate `E2E-5` (non-mocked) — the headline milestone:** one `POST /runs` with a
+real task drives all six jobs with the **real** model end to end. Assertions:
+
+- HTTP `202` with a ULID `run_id`
+- a buildset appears for the pushed `newrev` on `refs/heads/agent-runs`
+- all six builds reach a terminal state; planner/coder/validation/reviewer SUCCESS
+- `run-summary.json` validates against its schema and references every artifact
+- every artifact URL returns HTTP `200` with non-zero length
+- aggregate telemetry shows non-zero tokens and a real cost
+- the sandbox target repo is unmodified
+
+Plus the **UI verification in §11.7**, performed at this milestone.
+
+### Phase 6 — Hardening and demonstration
+
+Six scenarios. Each is a **Live E2E test** — real Zuul, real containers, real
+model. Only 6.3 substitutes a deliberately invalid model name, which is the
+fault being injected, not a mock.
+
+| # | Scenario | Injection method | Required outcome |
+|---|---|---|---|
+| 6.1 | Happy path | none | All jobs SUCCESS; complete artifact bundle |
+| 6.2 | Malformed agent output | prompt forces non-JSON prose | Runtime exit `30`; job FAILURE; downstream skipped; raw output still published |
+| 6.3 | Model failure | `--model does/not-exist` | Retries then exit `20`; bounded, explicit |
+| 6.4 | Invalid patch | task targets a file that does not exist at `base_sha` | `tool-validation` fails at check 3; reviewer skipped; summary states the reason |
+| 6.5 | Failing tests | task asks for a change that breaks a sandbox test | `tool-validation` fails at check 8 |
+| 6.6 | Workspace escape attempt | task asks to write outside `allowed_paths` | Exit `40`; target repo unmodified |
+
+Deliverables: `make e2e-6` running all six; `make demo` producing a reproducible
+transcript; `docs/RUNBOOK.md` with exact commands and expected outputs.
+
+**Gate `E2E-6` (non-mocked) = Definition of Done:** all six scenarios pass, plus
+the §11.7 UI verification is repeated and its evidence committed.
+
+### 11.7 Zuul web UI verification (manual Playwright, performed by the agent)
+
+**I will perform this myself** using the Playwright MCP browser tools, at
+**Phase 1** (smoke), **Phase 5** (headline), and **Phase 6** (final). This is a
+manual exploratory verification, not an automated suite — its purpose is to
+confirm a human can actually understand the run from the UI.
+
+**Preconditions:** stack up, at least one completed Live E2E buildset.
+
+**Procedure**
+
+| Step | Action | Assertion |
+|---|---|---|
+| 1 | `browser_navigate` → `http://localhost:9000/t/agents/status` | Page loads without login; pipeline `agent-run` visible |
+| 2 | `browser_navigate` → `/t/agents/buildsets` | ≥1 buildset row; result column populated |
+| 3 | `browser_click` the newest buildset | Buildset detail opens |
+| 4 | `browser_snapshot` | **All six jobs listed** with individual results; dependency order visible |
+| 5 | `browser_click` → `coder-agent` build | Console output rendered, not an error page |
+| 6 | `browser_find` "Artifacts" | Artifacts tab lists `patch.diff` and `agent-result.json` |
+| 7 | `browser_click` the `patch.diff` artifact | Serves a real unified diff over HTTP (log server on `:8000`) |
+| 8 | Navigate to a **skipped/failed** buildset (from 6.4) | Failure is legible; skipped jobs shown as SKIPPED, not silently absent |
+| 9 | `browser_console_messages` (level `error`) | **Zero** console errors — catches a misconfigured `[web] root` |
+| 10 | `browser_take_screenshot` → `.playwright-mcp/ui-<phase>-buildset.png` | Screenshot committed as evidence |
+
+**Evidence handling:** screenshots go to a **repo-relative** path
+(`.playwright-mcp/`) so they render inline in chat and can be committed;
+`/tmp` paths do not render. Each is embedded in `docs/poc.md` with
+`![...](../.playwright-mcp/...)`.
+
+**Explicit failure conditions** — any of these fails the gate:
+- the buildset page does not show all six jobs
+- artifact links 404 (indicates `zuul.log_url` or `trusted_rw_paths` misconfigured)
+- any browser console error
+- a login prompt appears for read-only browsing
+- the job graph does not reflect the declared `dependencies`
+
+**Why manual rather than automated:** the value here is judging *legibility* for
+a human operator — whether the run is understandable at a glance. That is not
+expressible as an assertion. The machine-checkable parts (artifact reachability,
+job results) are already covered by `E2E-5`, so this adds signal rather than
+duplicating it.
+
+### 11.8 Makefile targets
+
+Per AGENTS.md's standard command pattern, extended for the two test tiers:
+
+| Target | Purpose | Model cost |
+|---|---|---|
+| `make install` | npm install + pull pinned images | none |
+| `make run` | `docker compose up -d` + wait for healthy | none |
+| `make stop` | `docker compose down` | none |
+| `make clean` | down `-v` + remove build artifacts | none |
+| `make lint` | eslint + prettier + `yamllint` on Zuul config | none |
+| `make build` | tsc build all workspaces | none |
+| `make test` | unit + integration (**includes Piped E2E**) | **none** |
+| `make e2e` | **all Live E2E gates** `E2E-0` … `E2E-6` | real |
+| `make e2e-N` | a single Live E2E gate | real |
+| `make demo` | scripted happy-path run + transcript | real |
+| `make check-config` | assert semaphore names match between tenant and job config | none |
+
+`make test` must **never** require a model. `make e2e` must **never** accept a
+mock. Keeping these strictly separate is what stops Live E2E quietly decaying
+into fixture-replay.
+
+
+---
+
+## 12. Risk register
+
+| # | Risk | Likelihood | Impact | Mitigation |
+|---|---|---|---|---|
+| R1 | ~~`git` driver cannot host a config-project~~ | — | — | **RESOLVED §13/Q1: confirmed YES, no driver-type gate in `configloader.py`. Fallback ladder not needed.** |
+| R2 | ~~`enqueue-ref` + zero-`oldrev` branch creation~~ | — | — | **RESOLVED §13/Q3: confirmed BROKEN for `refs/heads/*`. Design changed to single permanent branch + real oldrev/newrev.** |
+| R3 | ~~`zuul.artifacts` not populated via `dependencies`~~ | — | — | **RESOLVED §13/Q2: confirmed NO. Runtime reads only `agent_result_<role>`; already the design.** |
+| R4 | Parent-var collision silently corrupts state | Medium | High | Mandatory `agent_result_<role>` prefixing; test asserts exact manifest contents |
+| R5 | Semaphore name typo silently serialises pipeline | Medium | Low | Makefile assertion comparing tenant config to job config |
+| R6 | Model nondeterminism makes Live E2E flaky | High | Medium | Assert on structure/invariants only, never prose; one retry per Live E2E; Piped E2E is the fast inner loop but **never substitutes** for a gate |
+| R7 | opencode NDJSON schema changes across versions | Medium | Medium | opencode pinned; parser tolerant (skip-unknown-type default, confirmed necessary by §13/Q5); contract test against a recorded fixture |
+| R8 | Executor-only jobs are a weak isolation boundary | High | Medium | Documented; remediated in Phase 4.5 |
+| R9 | Host RAM (7.3 GB) insufficient once launcher + node added | Medium | Medium | Semaphore `max: 2`; Gerrit permanently excluded; monitor in Phase 4 |
+| R10 | Zuul minor upgrade breaks config | Low | Medium | Images pinned to 14.2.0; upgrades are deliberate changes |
+| R11 | Prompt injection from the task description | Medium | Medium | Validation config lives in the trusted config-project; model output cannot alter gates |
+| R12 | Live E2E cost and wall-clock grow with every milestone | Medium | Low | Small sandbox repo; short tasks; semaphore `max: 2`; telemetry recorded per run |
+| R13 | Web UI shows blank build history | Low | Medium | **RESOLVED §13/Q6: anonymous read confirmed default; recipe locked in.** Residual risk is ZK/MariaDB connectivity, not config, caught by §11.7 step 9 |
+| R14 | Concurrent `POST /runs` race on the shared `agent-runs` branch push | Medium | Medium | **NEW (from §13/Q3 fix):** Run API's `git-writer` must serialize pushes (mutex/queue); added to Phase 1 tasks |
+
+---
+
+## 13. Open questions — RESOLVED (2026-09-09)
+
+All six were dispatched to parallel research subagents, one per question, each
+instructed to find the simplest robust answer within a tight tool-call budget.
+Findings below **supersede** the corresponding statements in §1 and §7.
+
+### Q1 — Can the `git` driver host a config-project? **YES — CONFIRMED**
+
+Source inspection of `zuul/configloader.py` (`TenantParser.loadTenantProjects`,
+v14.2.0): `trusted=True/False` is set purely from which YAML list
+(`config-projects` vs `untrusted-projects`) a repo appears under in the tenant
+config — **there is no driver-type check**. `zuul/driver/git/gitsource.py`
+implements the full `getGitUrl`/`getProjectBranches`/`getProject` interface the
+config-loading path requires; it only raises `NotImplementedError` for
+`canMerge`/`isMerged`, which are gating-pipeline concerns irrelevant to config
+loading.
+
+**Consequence:** the Gerrit-free fallback ladder (F1–F4, §1.8) is **not
+needed**. §7.3's `main.yaml` stands as originally written — a single `git`
+connection hosts both `zuul-config` (config-project) and `agent-runs`
+(untrusted-project). One quick empirical smoke test at Phase 0 (confirm the
+scheduler actually loads a `pipeline:`/`job:` from the git-driver config-project)
+closes the loop as a low-risk confirmation, not exploratory research.
+
+### Q2 — Is `zuul.artifacts` populated via plain `job.dependencies`? **NO — CONFIRMED**
+
+Docs (`job-content.html`) state `zuul.artifacts` is populated **only** via the
+`requires`/`provides` cross-project-change-matching mechanism. Separately, only
+"values other than those in the `zuul` hierarchy" are documented as propagated
+to `job.dependencies`-linked children — `zuul.artifacts` is explicitly outside
+that guarantee for this dependency style.
+
+**Consequence:** §1.4's defence-in-depth design is now confirmed **necessary,
+not merely cautious**. The runtime reads artifact URLs **exclusively** from the
+namespaced `agent_result_<role>.artifact_url` field (fully documented
+propagation path). `zuul.artifacts` is still populated by every job (via
+`zuul_return`) for the web UI's Artifacts tab and SQL history, but the runtime
+and `agent-tools` **never** read it for correctness. No schema change required.
+
+### Q3 — Does `enqueue-ref --oldrev 0000...0` work against the git driver for branch creation? **NO — CONFIRMED BROKEN. Design changed.**
+
+Source trace: `zuul/driver/git/gitconnection.py` computes changed files via
+`git diff <oldrev>..<newrev>`. With `oldrev` = all-zeros, this becomes
+`git diff 0000...0..<sha>`, which is **not a valid git revision range** — unlike
+Gerrit/GitHub, the git driver has no synthetic empty-tree handling for this
+case. The merger job fails, `getChangeFilesUpdated` raises, and the scheduler
+wraps it as `ValueError('Unknown change')` — **the enqueue is rejected**. This
+only affects `refs/heads/*` (a `Branch` change-key); tag/ref-only pushes are
+unaffected but irrelevant here.
+
+**Design change (replaces the original "one ref per run" scheme in §8):** use a
+**single, permanent branch** `refs/heads/agent-runs`, created once
+(`git commit --allow-empty` + push), never deleted. Each run appends a commit
+containing `runs/<run_id>/request.json` and fast-forwards that branch, so
+`oldrev`/`newrev` in `enqueue-ref` are always **real, non-zero SHAs**. The
+initializer playbook disambiguates the triggering run via:
+```bash
+git diff-tree --no-commit-id --name-only -r "{{ zuul.newrev }}"
+# -> runs/<run_id>/request.json
+```
+The Run API must **serialize pushes** to this branch (a mutex/queue in the
+`git-writer` module) to avoid non-fast-forward races under concurrent
+`POST /runs`. This is now a **required** Run API component, not an option —
+tracked as a new task in Phase 1.
+
+### Q4 — Minimum viable `poll_delay`? **RESOLVED: 60s**
+
+Source trace: `zuul/driver/git/gitwatcher.py`'s `_poll()` runs
+`git ls-remote --heads --tags` per project — a lightweight ref-advertisement
+query with no clone, no fetch, no local working copy. Cost per cycle is one
+subprocess spawn plus a small network round-trip; negligible on this host.
+
+**Decision:** `poll_delay=60` (not 30, to reduce log/spawn noise; not 7200,
+which is tuned for large production deployments). **Confirmed independent of
+run-triggering:** `enqueue-ref` is a direct scheduler management event with no
+relationship to the polling thread — this setting affects only how quickly the
+scheduler notices manual edits to `zuul-config`, never the latency of
+triggering an agent run.
+
+### Q5 — Does the opencode NDJSON stream include tool-call events? **YES — CONFIRMED EMPIRICALLY. Parser design corrected.**
+
+Live test (`opencode run --format json --pure`, a prompt forcing a `read` tool
+call) observed **four** distinct `type` values in this stream order:
+`step_start → text("\n\n") → tool_use(read) → step_finish(reason:"tool-calls")
+→ step_start → text("DONE") → step_finish(reason:"stop")`.
+
+Two corrections to §5.3/§5.4's parser design:
+1. **Leading whitespace-only `text` chunks can precede tool calls.** Naive
+   concatenation of all `type=="text"` events yields `"\n\n" + "DONE"`. The
+   normaliser must **trim the final concatenated string** before extracting
+   the fenced JSON block.
+2. **Multiple `step_finish` events occur per run** (one per model step/turn).
+   "Last wins" for telemetry is confirmed correct — do not sum across steps.
+3. **`tool_use` and `step_start` are real event types the parser must skip
+   silently.** The parser must default to **skip-unknown-type** rather than an
+   exhaustive enum switch, since these were unanticipated even in a single-tool
+   minimal test; a production run with multiple tools will have more.
+4. **Not exercised:** `error`/`permission-request` event types. The
+   skip-unknown-type default covers this defensively, but Phase 2's contract
+   tests must add a fixture once such an event is observed in the wild (e.g.
+   from a deliberately-failing tool call).
+
+### Q6 — Does the web UI render correctly with anonymous read? **YES — CONFIRMED, config recipe locked in**
+
+`authentication.html` states verbatim: *"By default, anonymous read access to
+any tenant is permitted."* `[auth]` sections are required **only** for
+privileged writes (`enqueue`, `enqueue-ref`, `autohold`, `promote`, `dequeue`) —
+never for browsing status/buildsets/builds/logs. **Phase 0–1 must configure no
+`access-rules`/`admin-rules` at all**, since their absence is precisely what
+preserves the open-read default.
+
+Confirmed `[web]` recipe (matches §7.2 exactly, no changes needed):
+```ini
+[web]
+listen_address=0.0.0.0
+port=9000
+root=http://localhost:9000
+```
+
+**Gotcha locked in for §11.7 step 9:** the #1 UI failure mode is browsing via a
+URL that doesn't exactly match `root` (scheme+host+port) — this breaks the
+SPA's API/websocket base-URL construction and shows as a blank status page with
+console XHR errors, easily mistaken for an auth problem. Always browse via
+`http://localhost:9000`, matching `root` exactly. Also confirmed: if pages load
+but buildsets/builds show empty, suspect ZK/MariaDB connectivity, not auth.
+
+---
+
+## 14. Definition of done (restated, testable)
+
+The PoC is complete when a single `POST /runs` produces a traceable Zuul
+buildset in which **all** of the following are demonstrated by re-runnable
+commands:
+
+- [ ] All three agent jobs invoke `opencode run` through the Node runtime
+- [ ] Each job's input manifest contains **only** declared upstream state
+- [ ] `coder-agent` produces a `patch.diff` artifact
+- [ ] `tool-validation` gates progression deterministically, independent of any model
+- [ ] `reviewer-agent` produces a structured, schema-valid assessment
+- [ ] The caller receives buildset status and working links to every artifact
+- [ ] All six failure scenarios are explicit, bounded, and automated
+- [ ] The target repository is provably unmodified after every run
+- [ ] **Every gate above was proven by a Live E2E run — real Zuul, real
+      containers, real model, no mocks in the path**
+- [ ] **No Gerrit is present anywhere in the stack**
+- [ ] **The complete run is inspectable in the Zuul web UI**, evidenced by
+      committed screenshots (§11.7)
+
+---
+
+## 15. Sources
+
+- Zuul job config — `https://zuul-ci.org/docs/zuul/latest/config/job.html`
+- Zuul return values — `https://zuul-ci.org/docs/zuul/latest/job-content.html#return-values`
+- Zuul semaphores — `https://zuul-ci.org/docs/zuul/latest/config/semaphore.html`
+- Zuul tenants / global semaphores — `https://zuul-ci.org/docs/zuul/latest/tenants.html`
+- Zuul auth — `https://zuul-ci.org/docs/zuul/latest/configuration.html#authentication`
+- Zuul admin client — `https://zuul-ci.org/docs/zuul/latest/client.html`
+- Zuul git driver — `https://zuul-ci.org/docs/zuul/latest/drivers/git.html`
+- Zuul REST API — `https://zuul-ci.org/docs/zuul/latest/rest-api.html`
+- Zuul release notes — `https://zuul-ci.org/docs/zuul/latest/releasenotes.html`
+- Initializer jobs spec (stale banner) — `https://zuul-ci.org/docs/zuul/latest/developer/specs/init-jobs.html`
+- zuul-client commands — `https://zuul-ci.org/docs/zuul-client/commands.html`
+- Example compose — `https://opendev.org/zuul/zuul/raw/branch/master/doc/source/examples/docker-compose.yaml`
+- Example configs — `https://opendev.org/zuul/zuul/src/branch/master/doc/source/examples/`
+- opencode CLI — `opencode run --help` (v1.18.29, this host)
+- opencode NDJSON format — live experiment, this host, 2026-09-09
