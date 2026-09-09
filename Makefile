@@ -1,5 +1,6 @@
 .PHONY: phase0-up phase0-down phase0-seed phase0-token phase0-e2e-0 phase0-clean \
-	check-config phase1-e2e-1 phase1-e2e-1-invalid phase1-reload
+	check-config phase1-e2e-1 phase1-e2e-1-invalid phase1-reload \
+	install build test lint format e2e-2
 
 COMPOSE := docker compose -p zuul-poc -f zuul/docker-compose.yaml
 
@@ -64,3 +65,33 @@ phase1-e2e-1:
 ## to prune the whole graph (agent-smoke must NOT run).
 phase1-e2e-1-invalid:
 	./zuul/scripts/e2e-1.sh --invalid
+
+## --- Phase 2: npm workspace targets (pure Node/TS, no Docker/Zuul) ---
+
+## Install all npm workspace dependencies.
+install:
+	npm install
+
+## Build all workspaces (generates agent-contracts types, then tsc -b).
+build:
+	npm run build --workspace @repo/agent-contracts
+	npx tsc -b
+
+## Run all unit + integration tests across workspaces. Uses --mock
+## everywhere; NEVER invokes a real model (plan §11.8).
+test:
+	npm run test --workspaces --if-present
+
+## eslint (TS-aware, no `any`) + prettier --check across the workspace.
+lint:
+	npx eslint .
+	npx prettier --check .
+
+## Auto-fix formatting.
+format:
+	npx prettier --write .
+
+## Gate E2E-2 (non-mocked): agent-runtime run --role planner against the
+## REAL opencode CLI. Costs real model tokens - never run as part of `test`.
+e2e-2:
+	./packages/agent-runtime/scripts/e2e-2.sh

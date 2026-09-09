@@ -1,0 +1,20 @@
+{
+  "name": "@repo/agent-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "npm run generate-types && tsc -b",
+    "generate-types": "node --experimental-strip-types scripts/generate-types.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1"
+  },
+  "devDependencies": {
+    "json-schema-to-typescript": "^15.0.3"
+  }
+}

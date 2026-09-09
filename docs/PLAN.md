@@ -1177,23 +1177,53 @@ not just a scheduler restart).
 
 ### Phase 2 — Contracts and runner
 
-| # | Task |
-|---|---|
-| 2.1 | npm workspaces, TS strict, Vitest, Makefile targets |
-| 2.2 | All four schemas + generated TS types |
-| 2.3 | `agent-runtime` CLI: input load/validate, prompt compose, opencode adapter, NDJSON parser, normaliser, retry, redaction, atomic write |
-| 2.4 | `--mock` mode + seven fixtures |
-| 2.5 | Unit + integration tests for every exit code |
-| 2.6 | Three prompt templates with embedded result schema and explicit output contract |
-| 2.7 | `make e2e-2` — Live E2E harness invoking the real model |
+**STATUS: COMPLETE.** Implementation in `packages/agent-contracts/`,
+`packages/agent-runtime/`, `packages/agent-tools/` (empty Phase-4 scaffold),
+`apps/run-api/` (git-writer module only, per the deferred 1.7 task), and
+`prompts/`. Reproducible via `make install`, `make build`, `make test`,
+`make e2e-2`. Pure Node/TS — no Docker/Zuul touched in this phase.
 
-**Gate:** `make test` green; every documented exit code demonstrated by a test.
+| # | Task | Status |
+|---|---|---|
+| 2.1 | npm workspaces, TS strict, Vitest, Makefile targets | ✅ Done — `package.json` workspaces `apps/*`+`packages/*`, `tsconfig.base.json` (ES2022, NodeNext, `noUncheckedIndexedAccess`), per-package `tsconfig.json`s + TS project references, Vitest per package, `make install/build/test/lint/format` |
+| 2.2 | All four schemas + generated TS types | ✅ Done — `task-request`/`agent-input`/`agent-result` copied verbatim from §4.1-4.3; `run-summary` designed per §4.4's prose (aggregates request, per-role results, validation report, buildset UUID, build/artifact URLs, final verdict, totals). Ajv (`ajv/dist/2020`) validators in `packages/agent-contracts/src/index.ts`; types generated via `json-schema-to-typescript` into `src/generated/*.d.ts`; root `schemas/` symlink verified resolving |
+| 2.3 | `agent-runtime` CLI (input/prompt/opencode/normalize/retry/redact/atomic-write) | ✅ Done — `node:util parseArgs`, `node:child_process.spawn` for opencode, all 8 exit codes wired |
+| 2.4 | `--mock` mode + seven fixtures | ✅ Done — `valid`, `malformed-json`, `missing-required-field`, `empty-output`, `oversized-output`, `timeout` (simulated via injectable sleep past `timeout_ms`, documented in `mock.ts`), `nonzero-exit` |
+| 2.5 | Unit + integration tests for every exit code | ✅ Done — 51 tests total (agent-contracts 6, agent-runtime 42, run-api 3), all passing. Every documented exit code (0,10,11,20,21,22,30,40) demonstrated by `packages/agent-runtime/test/run.integration.test.ts` |
+| 2.6 | Three prompt templates with embedded result schema | ✅ Done — `prompts/{planner,coder,reviewer}.md`; `packages/agent-runtime/src/prompt.ts` embeds the actual `agent-result.schema.json` JSON and a strict fenced-block output contract |
+| 2.7 | `make e2e-2` — Live E2E harness | ✅ Done — `packages/agent-runtime/scripts/e2e-2.sh`, real `opencode run` against `opencode/big-pickle`, no mock. **PASSED**: `tokens_input=469`, `duration_ms=36352` |
+| 1.7 (deferred) | Run API `git-writer` | ✅ Done — `apps/run-api/src/git-writer.ts`: hand-rolled promise-chain mutex, clone→append→commit→push cycle with up to 3 retries on non-fast-forward. Tested against a **real local bare git repo** (`git init --bare`), including a genuine concurrency test (8 parallel `pushRun` calls, asserted as a clean fast-forward chain with no lost update) |
 
-**Gate `E2E-2` (non-mocked):** `agent-runtime run --role planner` against the
-**real** `opencode/big-pickle` — no `--mock`, no fixture — writes an
-`agent-result.json` that validates against the schema, with
-`telemetry.tokens_input > 0` and `telemetry.duration_ms > 0` proving a genuine
-model call.
+**Gate: PASSED.** `make test` green (51/51 tests, 0 failures); every
+documented exit code demonstrated by a test in
+`packages/agent-runtime/test/run.integration.test.ts` (exit 0/10/11/20/21/22/30)
+and `packages/agent-runtime/test/workspace.test.ts` + the same integration
+file (exit 40).
+
+**Gate `E2E-2` (non-mocked): PASSED.** `agent-runtime run --role planner`
+against the real `opencode/big-pickle` model (no `--mock`, no fixture) wrote
+an `agent-result.json` that validated against the schema, with
+`telemetry.tokens_input=469 > 0` and `telemetry.duration_ms=36352 > 0`,
+proving a genuine model call. Reproducible via `make e2e-2`.
+
+**Notes and deviations:**
+- `agent-input.schema.json` (§4.2, copied verbatim from the plan) does not
+  carry `allowed_paths` from `task-request.schema.json` — it is not threaded
+  through the initializer → agent-input path in this phase. The workspace
+  confinement check (exit `40`) therefore uses a practical stand-in:
+  `workspace.mode: "read-only"` treats ANY diff/untracked file vs `base_sha`
+  as a violation; `read-write` is unrestricted by this check. Revisit once
+  `allowed_paths` is threaded through in a later phase.
+- `opencode run --format json --pure --model <model> --dir <workspace>
+  <prompt>` behaved exactly as documented in §1.11 during the live E2E-2
+  run — no discrepancy found; NDJSON shape, flag names, and telemetry
+  location (`step_finish.part.tokens`/`.cost`) all matched.
+- Ajv's `ajv/dist/2020` and `ajv-formats` are both dual CJS/ESM packages
+  with no `exports` map; under `NodeNext`+`esModuleInterop` TypeScript
+  could not infer a constructable default export for either. Worked around
+  by importing Ajv's named `Ajv2020` export directly, and loading
+  `ajv-formats` via `node:module`'s `createRequire` for the other. Documented
+  in `packages/agent-contracts/src/index.ts`.
 
 ### Phase 3 — Planner → coder state passing
 
