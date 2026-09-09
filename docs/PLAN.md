@@ -1,7 +1,7 @@
 # Implementation Plan — Zuul Agentic Workflow PoC
 
-Status: **IN PROGRESS — Phase 0 complete** (see `zuul/README.md`). Phases 1-6
-not yet implemented.
+Status: **IN PROGRESS — Phases 0-1 complete** (see `zuul/README.md`). Phases
+2-6 not yet implemented.
 Last verified against live sources: **2026-09-09**.
 Source of requirements: [docs/INITIAL.md](INITIAL.md).
 
@@ -81,6 +81,17 @@ as an explicit first node in the graph. Research confirms:
   jobs in the graph."* It must therefore **not** be listed in the project
   stanza's job list, and `planner-agent` must **not** declare a dependency on it.
   INITIAL.md's implied wiring is redundant at best.
+  **CORRECTION (Phase 1, empirically disproven):** the job graph is built from
+  the project stanza's job list ("any initializer jobs that it *encounters*"
+  per the dev spec) - an `initialize-agent-run` job that exists in
+  `zuul.d/jobs.yaml` but is absent from `zuul.d/projects.yaml`'s `jobs:` list
+  **never runs at all**. It DOES need to be listed there, exactly like a
+  regular job; what "auto-inserted as a dependency" actually buys you is that
+  you don't need to add an explicit `dependencies: [initialize-agent-run]` to
+  every other job - Zuul does that wiring for you once the initializer is
+  present in the list. Verified via `zuul/scripts/e2e-1.sh` (Phase 1): the job
+  was silently never scheduled with the old (incorrect) understanding, and
+  started running the moment it was added to `projects.yaml`.
 - ✅ Valid `job.type` values are exactly `regular`, `initializer`, `reporter`.
   `finalizer` does **not** exist.
 - 💡 An initializer job may return `zuul.child_jobs` to prune the graph. If
@@ -1137,20 +1148,32 @@ verify that finding empirically once, not to explore alternatives.
 
 ### Phase 1 — Zuul baseline + initializer
 
-| # | Task |
-|---|---|
-| 1.1 | `agent-run` pipeline; base job with `pre`/`post-logs`/`cleanup` playbooks |
-| 1.2 | Log volume + Apache log server; `zuul.log_url` returned by the base job |
-| 1.3 | `initialize-agent-run` as `type: initializer`: identifies the triggering run via `git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}` (§13/Q3), reads that `runs/<id>/request.json`, validates against `task-request.schema.json`, publishes `run-request.json` as an artifact |
-| 1.4 | Initializer emits `zuul.child_jobs: []` on an invalid request |
-| 1.5 | Global semaphore `agent-model-concurrency` (`max: 2`) + Makefile assertion that the name matches between tenant config and job config |
-| 1.6 | Verify the web UI renders the buildset and its artifact link (manual, §11.7); no `access-rules`/`admin-rules` configured, relying on the confirmed anonymous-read default (§13/Q6) |
-| 1.7 | **(R14, new)** Run API `git-writer`: serializing push mutex to the shared `refs/heads/agent-runs` branch, with retry-on-non-fast-forward |
+**STATUS: COMPLETE** (tasks 1.1-1.6). Implementation in `zuul/zuul-config/`
+(`zuul.d/jobs.yaml`, `zuul.d/projects.yaml`, `playbooks/base/`,
+`playbooks/init-run.yaml`), `zuul/etc_zuul/main.yaml` (global semaphore),
+`zuul/logs-image/httpd.conf` (CORS fix). Reproducible via `make phase1-reload`,
+`make check-config`, `make phase1-e2e-1`, `make phase1-e2e-1-invalid`.
+
+| # | Task | Status |
+|---|---|---|
+| 1.1 | `agent-run` pipeline; base job with `pre`/`post-logs`/`cleanup` playbooks | ✅ Done |
+| 1.2 | Log volume + Apache log server; `zuul.log_url` returned by the base job | ✅ Done |
+| 1.3 | `initialize-agent-run` as `type: initializer`: identifies the triggering run via `git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}` (§13/Q3), reads that `runs/<id>/request.json`, validates required keys (`task`/`repo`/`base_ref` - full JSON-Schema validation deferred to Phase 2 once `agent-contracts` exists), publishes `run-request.json` as an artifact | ✅ Done |
+| 1.4 | Initializer emits `zuul.child_jobs: []` on an invalid request | ✅ Done - proven by `make phase1-e2e-1-invalid` |
+| 1.5 | Global semaphore `agent-model-concurrency` (`max: 2`) + Makefile assertion that the name matches between tenant config and job config | ✅ Done. **Not yet attached to any job** (no job invokes a model until Phase 3's planner/coder) - documented in `jobs.yaml`'s `base` job description |
+| 1.6 | Verify the web UI renders the buildset and its artifact link (manual, §11.7); no `access-rules`/`admin-rules` configured, relying on the confirmed anonymous-read default (§13/Q6) | ✅ Done - screenshot `.playwright-mcp/phase1-buildset.png`, zero console errors |
+| 1.7 | **(R14) Run API `git-writer`** | ⏸️ **DEFERRED to Phase 2** - the npm workspace (where `git-writer` would live as a module) is not scaffolded until Phase 2 task 2.1; building it now would mean creating throwaway Node tooling outside the planned workspace layout. `zuul/scripts/e2e-1.sh` uses a plain `git clone`+`push` per invocation instead, which is adequate for the single-invocation Phase 1 gate but does NOT serialize concurrent pushes - Phase 2 must implement the real mutex before any concurrent `POST /runs` support. |
 
 **Gate:** a manually enqueued ref runs the initializer, publishes an artifact
 reachable over HTTP, and a deliberately malformed request skips all downstream
 jobs. The artifact is reachable **by clicking through the web UI**, not only by
-`curl`.
+`curl`. **PASSED** - see `zuul/README.md` for full write-up and deviations
+from the plan's stated facts (notably: the initializer job DOES need to be
+listed in the project's job list, contrary to §1.2's original claim, and a
+config-project change requires an explicit `zuul-scheduler full-reconfigure`,
+not just a scheduler restart).
+
+
 
 ### Phase 2 — Contracts and runner
 

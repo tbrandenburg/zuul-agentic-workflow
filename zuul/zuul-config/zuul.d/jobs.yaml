@@ -3,9 +3,23 @@
     parent: null
     abstract: true
     description: >
-      Phase 0 minimal base job. Executor-only (no nodeset) per plan §1.10 -
-      the real agent-runner node is introduced in Phase 4.
+      Base job with pre/post-logs/cleanup lifecycle (plan §1.1/§7.5).
+      Executor-only (no nodeset) per plan §1.10 - the real agent-runner node
+      is introduced in Phase 4. Does NOT yet carry the agent-model-concurrency
+      semaphore (plan §11 task 1.5): no job in this tenant invokes a model yet
+      (that starts with planner/coder in Phase 3), so attaching it here would
+      just serialise agent-smoke/initialize-agent-run for no reason. The
+      global-semaphore + tenant grant are declared now (etc_zuul/main.yaml)
+      so Phase 3 only needs to add `semaphores: [{name: agent-model-concurrency}]`
+      to the future abstract `agent` job.
     timeout: 600
+    pre-run: playbooks/base/pre.yaml
+    post-run:
+      - name: playbooks/base/cleanup.yaml
+        cleanup: true
+      - playbooks/base/post-logs.yaml
+    vars:
+      agent_artifacts_dir: "{{ zuul.executor.log_root }}/artifacts"
 
 - job:
     name: agent-smoke
@@ -14,3 +28,17 @@
       Trivial executor-only job used to prove enqueue-ref -> buildset ->
       SUCCESS with no launcher and no node (Phase 0 gate E2E-0).
     run: playbooks/agent-smoke.yaml
+
+- job:
+    name: initialize-agent-run
+    type: initializer
+    description: >
+      Auto-inserted initializer (plan §1.2/§7.5) - identifies the triggering
+      run from zuul.newrev, validates runs/<id>/request.json, and prunes the
+      whole graph (zuul.child_jobs: []) on an invalid request. MUST be listed
+      in the project stanza's job list, exactly like a regular job, or it
+      never gets scheduled at all (corrects the plan's original §1.2 claim -
+      see docs/PLAN.md's Phase 1 correction note). "Auto-inserted as a
+      dependency" only means every other listed job automatically depends on
+      it once it IS listed - it does not exempt it from being listed.
+    run: playbooks/init-run.yaml

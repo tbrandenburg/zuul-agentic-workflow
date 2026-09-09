@@ -1,0 +1,65 @@
+- hosts: localhost
+  gather_facts: false
+  vars:
+    triggering_worktree: "{{ zuul.executor.work_root }}/{{ zuul.project.src_dir }}"
+  tasks:
+    - name: Discover files changed by the triggering commit
+      command: "git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}"
+      args:
+        chdir: "{{ triggering_worktree }}"
+      register: changed_files
+      changed_when: false
+
+    - name: Identify the runs/<run_id>/request.json touched by this commit
+      set_fact:
+        run_request_rel_path: >-
+          {{ (changed_files.stdout_lines | select('match', '^runs/[^/]+/request\.json$') | list | first) | default('', true) }}
+
+    - name: Attempt to read and parse the run request (best-effort; validated below)
+      set_fact:
+        run_request: "{{ lookup('file', triggering_worktree ~ '/' ~ run_request_rel_path) | from_json }}"
+      when: run_request_rel_path != ''
+      register: run_request_parse
+      ignore_errors: true
+
+    - name: Determine whether the run request is valid (present, parseable JSON, required keys)
+      set_fact:
+        run_request_valid: >-
+          {{
+            run_request_rel_path != '' and
+            (run_request_parse is not failed) and
+            (['task', 'repo', 'base_ref'] | difference((run_request | default({})).keys() | list)) == []
+          }}
+
+    - name: Prune the job graph and fail with a clear reason (invalid or missing run request)
+      when: not run_request_valid
+      block:
+        - name: Skip all downstream jobs (fail-fast per plan §1.2/§1.4)
+          zuul_return:
+            data:
+              zuul:
+                child_jobs: []
+
+        - name: Report why the run request was rejected
+          fail:
+            msg: >-
+              Invalid or missing runs/<run_id>/request.json for newrev
+              {{ zuul.newrev }}. Path checked: '{{ run_request_rel_path }}'.
+              Changed files in commit: {{ changed_files.stdout_lines }}.
+
+    - name: Publish the validated request as a build artifact and let the graph continue
+      when: run_request_valid
+      block:
+        - name: Write the validated run request to the per-build artifacts directory
+          copy:
+            content: "{{ run_request | to_nice_json }}"
+            dest: "{{ agent_artifacts_dir }}/run-request.json"
+            mode: "0644"
+
+        - name: Return the run-request artifact reference (combined with log_url by Zuul)
+          zuul_return:
+            data:
+              zuul:
+                artifacts:
+                  - name: run-request
+                    url: artifacts/run-request.json

@@ -1,7 +1,7 @@
-# Zuul Phase 0 infrastructure spike
+# Zuul Phase 0-1 infrastructure
 
-Implements `docs/PLAN.md` §11 Phase 0. A minimal, pinned (14.2.0) Zuul stack
-proving:
+Implements `docs/PLAN.md` §11 Phase 0 and Phase 1. A minimal, pinned (14.2.0)
+Zuul stack proving:
 
 - a single `git` driver connection can host both a config-project
   (`zuul-config`) and an untrusted-project (`agent-runs`);
@@ -31,9 +31,87 @@ No Gerrit anywhere. No launcher/node in this phase (introduced in Phase 4).
 make phase0-up      # docker compose up (pulls/builds images, generates ZK TLS certs)
 make phase0-seed     # seed the bare repos served by gitserver
 make phase0-e2e-0    # gate: enqueue-ref -> buildset -> executor-only job SUCCESS
+
+make phase1-reload         # push zuul-config + force scheduler full-reconfigure
+make check-config          # assert the semaphore name matches tenant vs job config
+make phase1-e2e-1          # gate: initializer validates+publishes an artifact
+make phase1-e2e-1-invalid  # gate: invalid request prunes the whole graph
 ```
 
 Web UI: http://localhost:9000/t/agents/buildsets (anonymous read, no login).
+
+## Phase 1: base job lifecycle + initializer
+
+- `base` (`zuul-config/zuul.d/jobs.yaml`) now has a real `pre-run`
+  (`playbooks/base/pre.yaml`), `post-run: [cleanup.yaml (cleanup: true),
+  post-logs.yaml]` lifecycle. `post-logs.yaml` copies the **entire**
+  `zuul.executor.log_root` (not just a custom artifacts subdir) to
+  `/srv/static/logs/{{ zuul.build }}/` and returns `zuul.log_url` - this is
+  what makes both the web UI's Console/Logs tabs *and* our own artifacts work
+  from the same copy step.
+- `initialize-agent-run` (`type: initializer`, `playbooks/init-run.yaml`)
+  identifies the triggering commit's `runs/<run_id>/request.json` via
+  `git diff-tree --no-commit-id --name-only -r {{ zuul.newrev }}` run against
+  the checked-out `agent-runs` worktree at
+  `{{ zuul.executor.work_root }}/{{ zuul.project.src_dir }}`, validates the
+  required keys (`task`/`repo`/`base_ref`), and either publishes
+  `run-request.json` as an artifact or prunes the whole graph with
+  `zuul_return: data: zuul: child_jobs: []` (plus a `fail:` task for a clear
+  console message).
+- Global semaphore `agent-model-concurrency` (`max: 2`) is declared in
+  `etc_zuul/main.yaml` and granted to the tenant, but **deliberately not yet
+  attached to any job** - no job invokes a model until Phase 3's
+  planner/coder. `make check-config` asserts the name is present in both
+  places so a future typo is caught immediately rather than silently creating
+  an implicit `max: 1` semaphore.
+- Run API's `git-writer` (plan §11 task 1.7, risk R14) is **deferred to
+  Phase 2**, where the npm workspace it belongs in gets scaffolded.
+  `zuul/scripts/e2e-1.sh` does a plain unsynchronized `git clone`+`push` per
+  invocation, adequate for a single-invocation gate but not for concurrent
+  `POST /runs`.
+
+## Troubleshooting notes found in Phase 1
+
+- **A config-project change requires an explicit
+  `zuul-scheduler full-reconfigure`, not just a process restart.** On
+  startup, the scheduler loads the tenant's last-known layout from ZooKeeper
+  for speed ("Using system config from Zookeeper" in its log) rather than
+  re-parsing from git. `docker compose restart scheduler` after a
+  `zuul-config` push looks like it worked (clean "Config priming complete",
+  no errors) but silently keeps serving the stale layout. The git driver's
+  60s poll does **not** appear to trigger a reconfiguration on its own either
+  (at least not within several poll intervals in this setup). The fix:
+  `docker compose exec scheduler zuul-scheduler full-reconfigure` after every
+  `zuul-config` push - wired into `make phase1-reload`.
+- **`type: initializer` jobs must still be listed in the project stanza's job
+  list.** The plan's original research (§1.2) claimed the opposite based on a
+  literal reading of "always automatically inserted at the start of the job
+  graph"; empirically, an initializer job absent from `projects.yaml`'s
+  `jobs:` list simply never runs. What "auto-inserted" actually means is that
+  Zuul wires it as an implicit dependency of every other job in the graph, so
+  you don't need `dependencies: [initialize-agent-run]` on each of them - see
+  the corrected §1.2 in `docs/PLAN.md`.
+- **An unquoted colon-plus-space inside an Ansible task `name:` string breaks
+  YAML parsing** (e.g. `name: ... post-run cleanup: true playbook`) - the
+  parser reads it as a nested mapping key and fails with a cryptic "mapping
+  values are not allowed in this context" pointing at the `name:` line
+  itself, not the actual colon. Quote the whole string if it must contain a
+  literal colon.
+- **Apache's `Header set` directive does not apply to its own generated error
+  responses (404, etc.)** - only `Header always set ...` does. This matters
+  because the Zuul web UI's Console tab always requests
+  `job-output.json.gz` first and falls back to `job-output.json`; without
+  `Header always set Access-Control-Allow-Origin "*"` on the logs server, the
+  404 for the (by default, un-produced) `.gz` variant is a CORS console
+  error even though the plain `.json` fallback succeeds. We eliminated the
+  404 entirely by having `post-logs.yaml` also pre-compress
+  `job-output.json` to `job-output.json.gz` with Ansible's `archive` module.
+- **`zuul.project.src_dir` / `zuul.executor.work_root`** are the two facts
+  needed to locate a triggering project's checkout from a `hosts: localhost`
+  trusted playbook: the full path is
+  `{{ zuul.executor.work_root }}/{{ zuul.project.src_dir }}`. Discovered via a
+  temporary `debug: var=zuul` task (kept as a documented technique here, not
+  as leftover code).
 
 ## Known Phase-0-only limitations (intentionally deferred)
 

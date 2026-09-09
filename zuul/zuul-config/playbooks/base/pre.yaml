@@ -1,0 +1,12 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Announce build start
+      debug:
+        msg: "Starting build {{ zuul.build }} for newrev {{ zuul.newrev | default('unknown') }}"
+
+    - name: Ensure per-build artifacts directory exists
+      file:
+        path: "{{ agent_artifacts_dir }}"
+        state: directory
+        mode: "0755"

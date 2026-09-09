@@ -1,0 +1,50 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Ensure destination log directory exists
+      file:
+        path: "/srv/static/logs/{{ zuul.build }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check whether the per-build log directory (job-output.json/txt + artifacts) exists
+      stat:
+        path: "{{ zuul.executor.log_root }}"
+      register: log_root_stat
+
+    - name: Copy the entire per-build log directory to the log server
+      # Copies job-output.json/job-output.txt (written by Zuul's own log
+      # streaming) together with anything under agent_artifacts_dir (a
+      # nested "artifacts/" subdir of log_root) in one pass. Publishing the
+      # console log here (not just our custom artifacts) is required so the
+      # web UI's Console/Logs tabs can fetch job-output.json without a CORS
+      # 404 (Apache's Access-Control-Allow-Origin header is only sent for
+      # files that actually exist).
+      copy:
+        src: "{{ zuul.executor.log_root }}/"
+        dest: "/srv/static/logs/{{ zuul.build }}/"
+        remote_src: true
+      when: log_root_stat.stat.exists
+
+    - name: Pre-compress job-output.json (the web UI's Console tab requests the .gz variant first)
+      archive:
+        path: "/srv/static/logs/{{ zuul.build }}/job-output.json"
+        dest: "/srv/static/logs/{{ zuul.build }}/job-output.json.gz"
+        format: gz
+        remove: false
+      when: log_root_stat.stat.exists
+
+    - name: Write a build marker so log_url always resolves to non-empty content
+      copy:
+        dest: "/srv/static/logs/{{ zuul.build }}/build-info.txt"
+        content: |
+          build: {{ zuul.build }}
+          job: {{ zuul.job }}
+          newrev: {{ zuul.newrev | default('unknown') }}
+        mode: "0644"
+
+    - name: Return log_url for this build
+      zuul_return:
+        data:
+          zuul:
+            log_url: "http://localhost:8000/{{ zuul.build }}/"
