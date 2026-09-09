@@ -25,7 +25,7 @@ cd "$WORKDIR/agent-runs"
 OLDREV=$(git rev-parse HEAD)
 RUN_ID="e2e0-$(date +%s)"
 mkdir -p "runs/$RUN_ID"
-echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\"}" > "runs/$RUN_ID/request.json"
+echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\",\"repo\":\"sandbox/services/example\",\"base_ref\":\"main\"}" > "runs/$RUN_ID/request.json"
 git add -A
 git -c user.email=poc@local -c user.name=poc commit -q -m "run: $RUN_ID"
 NEWREV=$(git rev-parse HEAD)

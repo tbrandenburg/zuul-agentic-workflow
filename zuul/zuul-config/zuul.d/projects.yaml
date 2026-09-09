@@ -2,4 +2,5 @@
     name: agent-runs
     agent-run:
       jobs:
+        - initialize-agent-run
         - agent-smoke

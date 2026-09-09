@@ -1,5 +1,11 @@
+- global-semaphore:
+    name: agent-model-concurrency
+    max: 2
+
 - tenant:
     name: agents
+    semaphores:
+      - agent-model-concurrency
     source:
       agent-git:
         config-projects:
