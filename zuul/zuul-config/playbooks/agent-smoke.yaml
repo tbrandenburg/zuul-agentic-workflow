@@ -1,0 +1,14 @@
+- hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Announce noop success
+      debug:
+        msg: "Phase 0 executor-only noop job ran for {{ zuul.newrev | default('unknown') }}"
+
+    - name: Return a minimal namespaced result
+      zuul_return:
+        data:
+          agent_result_agent_smoke:
+            role: noop
+            status: success
+            summary: "Phase 0 executor-only smoke test job completed."

@@ -21,6 +21,11 @@ zuul/.zuul-scheduler/
 zuul/logs/
 *.log
 
+# Zuul PoC runtime state (bare repos + working checkout .git, both generated
+# by zuul/scripts/seed-repos.sh - never source of truth, always reproducible)
+zuul/gitserver-repos/
+zuul/zuul-config/.git/
+
 # Artifacts / agent runs (ephemeral job outputs)
 artifacts/
 /tmp/agent-*.json
