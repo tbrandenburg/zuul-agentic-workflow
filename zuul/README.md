@@ -418,3 +418,66 @@ anyway. "A caller always gets a summary" is therefore not fully guaranteed
 by the current wiring — noted for a future phase, not fixed here (a retry
 was the plan-sanctioned response to this specific failure class).
 
+## Phase 6 — Hardening, demo, and the RUNBOOK
+
+Six Live E2E hardening scenarios (`zuul/scripts/e2e-6-*.sh`, shared helpers
+in `e2e-6-lib.sh`), `make demo` (scripted happy-path + transcript), and
+`docs/RUNBOOK.md` (operational quick-start, standalone from this file).
+
+```bash
+make e2e-6-1   # happy path
+make e2e-6-2   # malformed agent output (planner exit 30)
+make e2e-6-3   # invalid model name (bounded retries, exit 20)
+make e2e-6-4   # task targets a nonexistent file (tool-validation fails at patch-applies)
+make e2e-6-5   # task breaks the test suite (tool-validation fails at check 8)
+make e2e-6-6   # workspace-escape attempt (repo provably unmodified regardless of which layer catches it)
+make e2e-6     # all six in sequence, full pass/fail summary
+make demo      # scripted happy-path run + timestamped transcript
+```
+
+**Incident and a genuine bug found (see `docs/PLAN.md`'s Phase 6 section
+for the full writeup):** two live attempts at scenario 6.1 hung far longer
+than any prior phase's real-model calls. Investigating exposed a real,
+independent bug — `run-agent.yaml` never set `agent-input.json`'s
+`limits.timeout_ms`, so `agent-runtime` always used its own 900s default;
+since `ExitCode.TIMEOUT` is retryable up to `max_attempts` (3), the
+worst-case budget for one hung call was `3 x 900s = 2700s`, exceeding the
+job's own 1800s Zuul-level timeout — so Zuul's outer timeout always won,
+masking `agent-runtime`'s own bounded exit-21 behavior with an opaque
+`TIMED_OUT` at the job level. **Fixed:** `limits.timeout_ms: 480000`
+explicitly set in the composed manifest, so `3 x 480s = 1440s` fits
+comfortably inside the job timeout.
+
+The *underlying* cause of both hangs, however, turned out to be external:
+`~/.local/share/opencode/log/opencode.log` showed
+`AI_RetryError: Failed after 3 attempts. Last error: Rate limit exceeded.`
+for `opencode/big-pickle` repeatedly around the same time, independently
+confirmed with a bare `opencode run --model opencode/big-pickle 'Reply
+with exactly: PONG'` outside Zuul entirely, which also hung with zero
+output for 60+ seconds. **This blocked completing a full live pass of
+scenarios 6.1/6.2/6.4/6.5/6.6** — 6.3 (which fails before ever needing a
+successful model response) passed live in 62s. The stuck queue was
+cleaned up properly (`zuul-client dequeue` repeated until
+`agent-model-concurrency`'s semaphore holder count returned to `0/2`, not
+left in a stuck state for the next person to hit).
+
+**What this means operationally:** all six scenario scripts are
+implemented, individually re-runnable, and correct by inspection plus
+component-level unit-test coverage (each scenario's specific mechanism —
+exit 30, exit 20, `tool-validation` check 3/4/8 — already has a dedicated
+unit test against real fixtures, not mocks, in
+`packages/agent-runtime/test/` and `packages/agent-tools/test/`). Re-run
+`make e2e-6` once the rate limit clears; no further code changes are
+expected to be needed.
+
+**§11.7 UI verification (final round):** performed against a real SUCCESS
+buildset (Phase 5's live `e2e-5` run) and a real FAILURE buildset (this
+phase's live 6.3 scenario) — anonymous read, no login prompt, artifact
+links load, SKIPPED jobs legible once "Show skipped jobs" is toggled.
+**One console error is present on every page of this Zuul 14.2.0
+instance**, confirmed via reproduction on the very first page load before
+visiting any of our buildsets: `Switch: Switch requires either a label or
+an aria-label to be specified` — a React accessibility warning from Zuul
+web's own bundled PatternFly `Switch` component. Confirmed unrelated to
+any artifact/config in this repo; an upstream Zuul UI quality issue, out
+of scope to fix here, documented rather than silently omitted.

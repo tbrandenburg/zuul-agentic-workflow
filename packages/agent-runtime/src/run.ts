@@ -106,13 +106,25 @@ export async function executeRun(args: RunArgs): Promise<number> {
     writeOutputs(args, finalResult, lastOutcome);
     return ExitCode.SUCCESS;
   } catch (err) {
+    // Phase 6 (6.2 requirement): even on a failure that never reaches a
+    // valid AgentResult (e.g. exit 30 - no fenced json block found), the
+    // RAW model output must still be published so an operator can inspect
+    // what the model actually said. writeOutputs() below only ran on the
+    // success path before this fix, so a normalize/model failure silently
+    // published nothing - a real gap relative to this requirement, fixed
+    // here rather than assumed. Never overwrites --output (no valid
+    // AgentResult exists in this branch), only the raw stdout/stderr logs.
+    writeRawArtifacts(args, lastOutcome);
     return handleKnownError(err);
   }
 }
 
 function writeOutputs(args: RunArgs, result: AgentResult, outcome: OpencodeOutcome | undefined): void {
   atomicWriteFile(args.output, `${JSON.stringify(result, null, 2)}\n`);
+  writeRawArtifacts(args, outcome);
+}
 
+function writeRawArtifacts(args: RunArgs, outcome: OpencodeOutcome | undefined): void {
   if (args.artifacts && outcome) {
     mkdirSync(args.artifacts, { recursive: true });
     atomicWriteFile(path.join(args.artifacts, "stdout.log"), redactString(outcome.stdout));
