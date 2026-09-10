@@ -30,6 +30,11 @@ ZUUL_URL="${ZUUL_URL:-http://localhost:9000}"
 TENANT="${TENANT:-agents}"
 PIPELINE="${PIPELINE:-agent-run}"
 PROJECT="${PROJECT:-agent-runs}"
+# Phase 4: coder-agent clones /repo and checks out base_ref for real (even
+# in --mock mode) - a hardcoded "main" would fail on any branch where
+# sandbox/services/example doesn't exist yet. Use whatever /repo actually
+# has checked out.
+BASE_REF="$(git -C "$ROOT_DIR/.." rev-parse --abbrev-ref HEAD)"
 
 MODE="live"
 if [ "${1:-}" = "--mock" ]; then
@@ -70,7 +75,7 @@ fi
 # never sent to a model at all; in live mode it costs real tokens for both
 # planner and coder roles, so it stays trivial regardless.
 cat > "runs/$RUN_ID/request.json" <<EOF
-{"task": "Say hello in one sentence.", "repo": "sandbox/services/example", "base_ref": "main", "mock": $MOCK_FIELD}
+{"task": "Say hello in one sentence.", "repo": "sandbox/services/example", "base_ref": "$BASE_REF", "mock": $MOCK_FIELD}
 EOF
 
 git add -A

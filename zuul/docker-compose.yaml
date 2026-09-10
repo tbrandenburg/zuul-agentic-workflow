@@ -129,6 +129,17 @@ services:
       - "${HOME}/.opencode/bin:/opt/opencode-bin:ro"
       - "${HOME}/.nvm/versions/node/v24.15.0:/opt/node:ro"
       - "${HOME}/.local/share/opencode:/root/.local/share/opencode:rw"
+      # Phase 4: git's "dubious ownership" protection refuses any git
+      # invocation against /repo (host-owned, uid 1000, remapped to the
+      # bwrap overflow uid 65534 inside the sandbox's user namespace) from
+      # inside a trusted-project playbook. GIT_CONFIG_* env vars alone
+      # (set per-task, see zuul-config/playbooks/{init-run,run-agent,
+      # validate-result}.yaml) were NOT sufficient in testing - this file
+      # ALSO needs to be explicitly listed in [executor] trusted_ro_paths
+      # (zuul.conf) for bubblewrap to expose it to those playbooks at all
+      # (same visibility-gap class as the PATH/bind-mount gap from Phase 3
+      # - see zuul/README.md's troubleshooting notes for the full story).
+      - "./etc_zuul/gitconfig:/root/.gitconfig:ro"
     networks:
       - zuul
 

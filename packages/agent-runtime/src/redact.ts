@@ -1,17 +1,11 @@
+import { SECRET_PATTERNS } from "@repo/agent-contracts";
+
 const REDACTED = "***REDACTED***";
 
-const PATTERNS: RegExp[] = [
-  // AWS access key IDs
-  /AKIA[0-9A-Z]{16}/g,
-  // Generic api_key/api-key/apikey = or : value
-  /(api[_-]?key\s*[:=]\s*)([^\s"'`,)]+)/gi,
-  // Bearer tokens
-  /(Bearer\s+)([A-Za-z0-9\-._~+/]+=*)/g,
-  // Generic secret/token = value assignments
-  /((?:secret|token|password)\s*[:=]\s*)([^\s"'`,)]+)/gi,
-  // PEM private key blocks
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
-];
+// Phase 4: extracted to packages/agent-contracts/src/secret-patterns.ts so
+// packages/agent-tools/src/secrets.ts can reuse the exact same regex set
+// (docs/PLAN.md §6 check 6) instead of duplicating it.
+const PATTERNS: RegExp[] = SECRET_PATTERNS;
 
 /** Applies a regex-based secret-redaction pass over a single string. */
 export function redactString(input: string): string {

@@ -90,3 +90,24 @@
 
 - job: {name: planner-agent, parent: agent, vars: {agent_role: planner, prompt_file: prompts/planner.md}}
 - job: {name: coder-agent,   parent: agent, vars: {agent_role: coder,   prompt_file: prompts/coder.md}}
+
+- job:
+    name: tool-validation
+    parent: base
+    description: >
+      Phase 4 (plan §6/§7.5, tasks 4.3/4.4): runs `agent-tools validate`'s
+      9 ordered, fail-fast deterministic checks against the coder's
+      patch.diff + agent-result.json, read via the shared `logs` Docker
+      volume path (never an HTTP round trip - coder-agent and
+      tool-validation are separate builds on the same executor host, and
+      "localhost:8000" resolves to the calling container's OWN loopback,
+      not the `logs` service, from inside a container - see
+      playbooks/validate-result.yaml's own comment for the full reasoning).
+      Depends on coder-agent per projects.yaml. Deliberately NOT parented to
+      `agent` (it invokes agent-tools, not agent-runtime/opencode, and needs
+      no model-concurrency semaphore) but IS parented to `base` for the
+      shared pre-run/post-logs/cleanup lifecycle (same reason every other
+      job needs it: publishing validation-report.json/.md to the log
+      server).
+    timeout: 900
+    run: playbooks/validate-result.yaml

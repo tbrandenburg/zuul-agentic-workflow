@@ -24,4 +24,6 @@
         - planner-agent
         - coder-agent:
             dependencies: [planner-agent]
+        - tool-validation:
+            dependencies: [coder-agent]
 

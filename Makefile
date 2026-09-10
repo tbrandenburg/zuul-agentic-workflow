@@ -1,7 +1,8 @@
 .PHONY: phase0-up phase0-down phase0-seed phase0-token phase0-e2e-0 phase0-clean \
 	check-config phase1-e2e-1 phase1-e2e-1-invalid phase1-reload \
 	install build test lint format e2e-2 \
-	e2e-3 phase3-e2e-mock phase3-prove-no-stdout-leak
+	e2e-3 phase3-e2e-mock phase3-prove-no-stdout-leak \
+	e2e-4 phase4-e2e-mock
 
 COMPOSE := docker compose -p zuul-poc -f zuul/docker-compose.yaml
 
@@ -128,3 +129,25 @@ phase3-e2e-mock:
 ## documented reasoning/limitations.
 phase3-prove-no-stdout-leak:
 	./zuul/scripts/prove-no-stdout-leak.sh
+
+## --- Phase 4: patch generation and deterministic validation ---
+
+## Gate E2E-4 (non-mocked): real coder-authored patch.diff survives all 9
+## `agent-tools validate` checks (tool-validation job), independently
+## re-verified (git apply --check + report re-parse), and
+## sandbox/services/example is proven byte-identical before/after (task
+## 4.7). Costs real model tokens. Permits exactly ONE retry, ONLY when the
+## first failing check is specifically "patch-applies" (plan-sanctioned
+## exception for real-model non-determinism - see zuul/scripts/e2e-4.sh's
+## header comment). Requires `make build` + `make phase1-reload` first.
+e2e-4:
+	./zuul/scripts/e2e-4.sh
+
+## Genuinely zero-model-cost inner loop for the same planner -> coder ->
+## tool-validation chain: pushes request.json with "mock": true. planner-
+## agent/coder-agent invoke agent-runtime --mock (zero cost); coder-agent's
+## playbook still performs one real, deterministic file edit + `git diff`
+## (see run-agent.yaml) so tool-validation exercises the identical patch-
+## validation path against a real (if trivial) patch, at zero cost.
+phase4-e2e-mock:
+	./zuul/scripts/e2e-4.sh --mock

@@ -1,7 +1,8 @@
 # Implementation Plan — Zuul Agentic Workflow PoC
 
-Status: **IN PROGRESS — Phases 0-1 complete** (see `zuul/README.md`). Phases
-2-6 not yet implemented.
+Status: **IN PROGRESS — Phases 0-3 complete, Phase 4 mostly complete** (4.1-4.4,
+4.7-4.8 done; 4.5-4.6 deferred with justification — see §11 Phase 4). Phases
+5-6 not yet implemented.
 Last verified against live sources: **2026-09-09**.
 Source of requirements: [docs/INITIAL.md](INITIAL.md).
 
@@ -1323,33 +1324,144 @@ planner's returned summary.
   ("the model name is configuration, not hardcoded into job definitions").
 
 
-</content>### Phase 4 — Patch generation and deterministic validation
+ ### Phase 4 — Patch generation and deterministic validation
 
-| # | Task |
-|---|---|
-| 4.1 | `sandbox/services/example` with lint + a fast test suite |
-| 4.2 | Coder produces `artifacts/patch.diff` against the pinned `base_sha` |
-| 4.3 | `agent-tools validate`: all nine checks |
-| 4.4 | `tool-validation` job; report published as JSON + Markdown |
-| 4.5 | Introduce the real `agent-runner` node: `launcher` service, `[connection static]`, image/flavor/label/section/provider, node container, SSH keys |
-| 4.6 | Move agent jobs onto the `agent-runner` nodeset |
-| 4.7 | Prove the target repo is byte-identical before and after a run |
-| 4.8 | `make e2e-4` — Live E2E producing a real model-authored patch |
+**STATUS: MOSTLY COMPLETE (4.1-4.4, 4.7, 4.8 implemented; 4.5/4.6 DEFERRED,
+see below).** Implementation in `sandbox/services/example/`,
+`packages/agent-tools/` (was an empty Phase-2 scaffold, now fully
+implemented), `packages/agent-contracts/src/secret-patterns.ts` (new -
+extracted from `packages/agent-runtime/src/redact.ts`), `zuul/zuul-config/`
+(`zuul.d/jobs.yaml`'s `tool-validation` job, `zuul.d/projects.yaml`,
+`playbooks/init-run.yaml`'s `base_sha` resolution, `playbooks/run-agent.yaml`'s
+coder-specific clone/patch-generation, `playbooks/validate-result.yaml` -
+new), `zuul/scripts/e2e-4.sh` (new), `Makefile` (`e2e-4`, `phase4-e2e-mock`).
 
-**Gate:** a mock coder patch passes all nine checks; a deliberately bad patch
-fails at the correct check with a precise message; `git status` in the sandbox
-repo is clean after every run.
+| # | Task | Status |
+|---|---|---|
+| 4.1 | `sandbox/services/example` with lint + a fast test suite | ✅ Done — two files (`index.js`, `lib/math.js`), `test/math.test.js` (`node --test`), package-local flat `eslint.config.js`. `base_sha` is deliberately **not** hardcoded anywhere (would go stale the instant this commit lands) — it is resolved dynamically, per run, by `init-run.yaml` via `git -C /repo rev-parse <base_ref>` against the trusted `/repo` mount. Documented in the sandbox's own README. |
+| 4.2 | Coder produces `artifacts/patch.diff` against the pinned `base_sha` | ✅ Done — `run-agent.yaml` now clones `/repo` (never the untrusted `agent-runs` project) into a THROWAWAY per-build directory for the coder role only, checks out `base_sha`, points `agent-input.json`'s `workspace.path` at the cloned service dir with `mode: "read-write"` (opencode's `edit` tool is `allow`-by-default per opencode's own permission defaults — verified via `/docs/permissions/` — so no `--auto` or extra opencode config was needed for the coder to actually write files), then runs `git diff --no-color <base_sha> -- <repo>` scoped to that clone and publishes the result as `artifacts/coder/patch.diff`, with a `patch_url` field added to the namespaced `agent_result_coder` var (mirroring `artifact_url`). |
+| 4.3 | `agent-tools validate`: all nine checks | ✅ Done — `packages/agent-tools/src/{types,patch,allowlist,secrets,clone,exec,lint,test,claims,summary,validate,cli}.ts`, fail-fast in the exact order of plan §6's table, checks 1-8 FAILURE-severity, check 9 (`claims-cross-check`) WARNING-only and never blocks `passed`. 11 Vitest integration tests in `packages/agent-tools/test/validate.test.ts` against a REAL git fixture repo (not mocks): one all-9-PASS scenario plus one deliberately-bad scenario per FAILURE-severity check (8 scenarios), each asserted to fail at the CORRECT check with a precise message, plus a WARN-only claims scenario and an `allowed_paths`-from-request.json scenario. Every test also asserts `git status --porcelain` on the fixture repo is empty before AND after, proving it is never mutated (checks 3/7/8 always operate on a `createThrowawayClone()`-produced temp directory). |
+| 4.4 | `tool-validation` job; report published as JSON + Markdown | ✅ Done — `zuul.d/jobs.yaml`'s `tool-validation` (`parent: base`, `timeout: 900`, depends on `coder-agent` per `projects.yaml`), `playbooks/validate-result.yaml` invokes `agent-tools validate` and returns `agent_result_validation` (role/status/summary/artifact_url). **Deviation from the task brief's literal wording:** rather than an HTTP `get_url` fetch of the coder's artifacts (the brief's phrasing, mirroring how `zuul/scripts/e2e-*.sh` fetch artifacts from the HOST), the playbook reads them directly off the `logs` Docker **volume** that `executor` and `logs` already share identically at `/srv/static/logs` (`http://localhost:8000/<build>/...` and `/srv/static/logs/<build>/...` are the exact same bytes) — `"localhost:8000"` does not resolve from inside the `executor` container's network namespace, only for callers outside the compose network (the host, e.g. `e2e-4.sh`'s own `curl` calls). A regex substitution turns each `agent_result_*`'s HTTP artifact URL into its equivalent host-filesystem path. **`allowed_paths` for check 4** is read from the original `runs/<id>/request.json` if that field is present (now genuinely threaded through by `init-run.yaml`'s `base_sha` resolution task, which also captures `allowed_paths`), defaulting to "anything under the run's own `repo` value" otherwise (`packages/agent-tools/src/allowlist.ts`'s `resolveAllowedPaths` — documented there per the task brief's explicit instruction to document this choice). |
+| 4.5 | Introduce the real `agent-runner` node: `launcher` service, `[connection static]`, image/flavor/label/section/provider, node container, SSH keys | ⏸️ **DEFERRED**, per this task's own explicit authorization to do so with justification. See "Deferral of 4.5/4.6" below. |
+| 4.6 | Move agent jobs onto the `agent-runner` nodeset | ⏸️ **DEFERRED** (depends on 4.5). Agent jobs remain executor-only, exactly as they were through Phases 1-3 — a pre-existing, already-documented residual risk (plan §1.10/§9/R8), not a new one introduced by this phase. |
+| 4.7 | Prove the target repo is byte-identical before and after a run | ✅ Done — `zuul/scripts/e2e-4.sh` computes a recursive `sha256sum` over every file under `sandbox/services/example/` (excluding `node_modules/`) both before enqueuing and after the full chain reaches a terminal state (mock or live), and fails the gate if they differ. This is on top of (not instead of) the unit-test-level proof in task 4.3 (`git status --porcelain` clean before/after every `runValidation()` call). |
+| 4.8 | `make e2e-4` — Live E2E producing a real model-authored patch | ✅ Done — `zuul/scripts/e2e-4.sh` (real mode) / `--mock` (zero-cost mode), `Makefile`'s `e2e-4`/`phase4-e2e-mock`. **Deviation:** rather than extending `packages/agent-runtime/fixtures/` with a new patch-bearing NDJSON fixture (the task brief's suggestion), the mock path performs its deterministic "model edit" **in the playbook** (`run-agent.yaml`'s `blockinfile` task, gated on `agent_role == 'coder' and agent_mock`) rather than in `agent-runtime`/its fixtures - `packages/agent-runtime/src/mock.ts` replays a recorded NDJSON transcript and **never touches the filesystem at all** (by design, see its own module doc comment), so no fixture, however constructed, can make the mock CLI itself perform a real file edit; the only way to exercise the SAME patch-generation → `git diff` → `tool-validation` path at zero model cost is to perform a real, deterministic filesystem edit somewhere outside `agent-runtime`. The playbook is that "somewhere", and is documented at the point of use. |
 
-**Gate `E2E-4` (non-mocked):** the **real** model is given a genuine task
-against `sandbox/services/example` and produces a `patch.diff` that
-`git apply --check` accepts at the pinned `base_sha` and that passes lint and
-the sandbox test suite. Assertions are structural (patch parses, applies,
-touches only allowlisted paths, tests pass) — never on the patch's content.
+**Gate: PASSED (mock).** `make phase4-e2e-mock` performs a genuinely zero-cost
+run: `planner-agent`/`coder-agent` invoke `agent-runtime --mock`, the coder's
+playbook applies its one deterministic edit and computes a real `git diff`,
+`tool-validation` runs the real `agent-tools validate` CLI against that real
+(if trivial) patch, and the gate asserts all 9 checks with 1-8 PASS. A
+deliberately bad patch fails at the correct check with a precise message
+(unit-level proof: `packages/agent-tools/test/validate.test.ts`, 8 distinct
+FAILURE-severity scenarios). `git status` in the sandbox repo (and in every
+`agent-tools` throwaway clone) is clean after every run.
 
-⚠️ Honest risk: a model may produce a non-applying patch on any given run. This
-gate therefore permits **one retry**, and if it still fails, that is a genuine
-finding about prompt quality to fix in Phase 4 — **not** a reason to weaken the
-gate or fall back to a fixture.
+**Gate `E2E-4` (non-mocked):** `make e2e-4` — the real model is given a
+genuine, trivial task against `sandbox/services/example` (per plan §10 cost
+discipline: "add a one-line comment above the add function") and must produce
+a `patch.diff` that `git apply --check` accepts at the pinned `base_sha` and
+that passes lint and the sandbox test suite, all independently re-verified by
+the gate script (not just trusted from `tool-validation`'s own report).
+Assertions are structural — never on the patch's content. Permits **exactly
+one retry**, and only when the FIRST failing check in the validation report is
+specifically `patch-applies` (any other failing check — lint, test, allowlist,
+secret-scan, ... — is treated as a genuine finding, not retried).
+
+**Deferral of 4.5/4.6 (real `agent-runner` node, launcher, static node
+connection):** per this task's own explicit authorization ("you are explicitly
+authorized to defer it with clear justification... if it threatens to consume
+disproportionate effort relative to the core deterministic-validation
+deliverable"), 4.5/4.6 are deferred. Rationale:
+
+- Plan §1.10 itself flags this as "significant unstated work" requiring a new
+  `launcher` compose service, a `[connection static]` in `zuul.conf`, a static
+  node container with provisioned SSH host keys, and a full
+  image/flavor/label/section/provider object graph — none of which exists yet
+  anywhere in this repo.
+- The core Phase 4 deliverable — deterministic, fail-fast patch validation
+  (tasks 4.1-4.4, 4.7, 4.8) — is fully implemented and gated (`E2E-4` passes,
+  `phase4-e2e-mock` passes, zero regressions in `make test`) **without** this
+  node; nothing about deterministic validation depends on which node class ran
+  the upstream planner/coder jobs.
+- Plan §9 and risk `R8` already accept executor-only jobs as a **documented,
+  known PoC limitation** through Phase 3; this defers that same, already-priced
+  risk one further phase rather than introducing a NEW one. Risk `R9` (host RAM
+  headroom for launcher + node) also remains unexercised, which is a net
+  simplicity win for a 7.3 GB host running the rest of the stack.
+- Residual risk carried forward unchanged: agent jobs still execute inside the
+  executor's own bubblewrap jail, not a dedicated, genuinely isolated node.
+  This is **not** a new risk introduced by Phase 4 — it is the same one
+  Phase 1-3 already accepted and documented, now simply carried one phase
+  further. It should be revisited before this PoC is treated as a template for
+  anything beyond a local demonstration.
+
+**Notes and deviations:**
+- **Secret-pattern extraction location:** `packages/agent-runtime/src/redact.ts`'s
+  regex set moved verbatim to `packages/agent-contracts/src/secret-patterns.ts`
+  (exported as `SECRET_PATTERNS`) rather than into `agent-tools` or a brand-new
+  package. Both `agent-runtime` (output redaction) and `agent-tools` (check 6,
+  secret scan) already depend on `@repo/agent-contracts`, so this was the only
+  option that avoided BOTH duplicating the regexes and introducing a new
+  cross-package dependency edge.
+- **Throwaway-clone tooling access:** `agent-tools`' `createThrowawayClone()`
+  symlinks (never copies) the ORIGINAL repo's `node_modules` into the clone
+  root, because `sandbox/services/example`'s `lint`/`test` npm scripts rely on
+  tools (`eslint`) hoisted at the monorepo root, and `git clone` never carries
+  `node_modules` (gitignored). A symlink lets `npm run lint`/`npm test` resolve
+  those tools inside the throwaway clone without a slow `npm install` per
+  validation run, and without ever writing anything back into the original
+  repo (the symlink lives only inside the disposable clone).
+- **`agent-input.schema.json`'s `workspace.mode: "read-write"` disables the
+  Phase 2 read-only confinement check entirely** for the coder role (already
+  true since Phase 2 — see `packages/agent-runtime/src/workspace.ts`'s own
+  comment) — this is now load-bearing rather than incidental, since the coder
+  genuinely needs to write files. Confinement for the coder is instead
+  enforced by `agent-tools`' checks 4/5 (allowlist/forbidden-paths) on the
+  resulting patch, which is the deterministic, trusted-side control the whole
+  `tool-validation` job exists to provide.
+- `docs/PLAN.md`'s own task 4.4 brief predates the discovery that
+  `"localhost:8000"` is not reachable from inside the `executor` container
+  (only from the host) — see the 4.4 row above for the fix (shared-volume path
+  substitution instead of an HTTP fetch).
+
+**Coordinator live-validation findings (post-handoff, before commit):** the
+implementing subagent could not exercise the Zuul-level chain at all (its
+changes were uncommitted, and `git clone /repo` only ever sees committed
+history — confirmed and documented in its own handoff). The coordinator
+committed locally and ran the full chain, finding and fixing three real bugs
+before any gate would pass:
+1. **`/root/.gitconfig` (added for git's "dubious ownership" protection) is
+   invisible to Zuul's trusted-project playbooks inside bubblewrap**, exactly
+   like the Phase 3 PATH/bind-mount gap — it had to be added to
+   `[executor] trusted_ro_paths` in `zuul.conf`, not just bind-mounted into
+   the container. `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0` env vars and inline
+   `-c safe.directory=*` flags (both tried first, both insufficient alone)
+   are kept as defense-in-depth but were **not** the actual fix.
+2. **Three `command:` tasks in `run-agent.yaml` and one in `init-run.yaml`
+   were missing `HOME: /root`** in their `environment:` block (only `PATH`
+   was set) — silent `dubious ownership` failures resulted since git could
+   not resolve `$HOME` at all in a couple of cases, and inconsistent
+   environments across otherwise-identical-looking tasks in general.
+3. **`zuul/scripts/e2e-0.sh`/`e2e-1.sh`/`e2e-3.sh` hardcoded `base_ref:
+   "main"`**, which broke the moment `coder-agent` started actually cloning
+   `/repo` and checking out that ref (Phase 4) — `main` does not yet contain
+   `sandbox/services/example` until this phase's branch merges. Fixed by
+   resolving `base_ref` dynamically from `/repo`'s current branch (matching
+   `e2e-4.sh`'s existing, correct pattern), so these scripts work correctly
+   both before and after merge.
+
+All five prior gates (`phase0-e2e-0`, `phase1-e2e-1`, `phase1-e2e-1-invalid`,
+`phase3-e2e-mock`, `phase4-e2e-mock`) and the new live `e2e-4` gate were then
+independently re-run and PASSED. Live `e2e-4` needed one full retry (the
+*planner* role hit the same task-description-sensitive exit-30 model
+non-determinism documented in Phase 3 — not a Phase 4-specific defect); the
+successful run produced a genuine, minimal, real model-authored patch
+(`// Returns the sum of two numbers.` above `add()` in
+`sandbox/services/example/lib/math.js`) that passed all 9 checks, real lint,
+and the real `node --test` suite, with the sandbox repo confirmed
+byte-identical on disk afterward. Evidence: `.playwright-mcp/phase4-buildset.png`
+(zero console errors, all 5 jobs SUCCESS, all in dependency order).
 
 ### Phase 5 — Review and run summary
 
@@ -1361,6 +1473,7 @@ gate or fall back to a fixture.
 | 5.4 | Run API `GET /runs/:id` and `/runs/:id/summary` backed by the REST API |
 | 5.5 | Artifact bundle: request, three results, patch, validation report, prompts, logs, telemetry |
 | 5.6 | `make e2e-5` — Live E2E for the complete pipeline |
+
 
 **Gate `E2E-5` (non-mocked) — the headline milestone:** one `POST /runs` with a
 real task drives all six jobs with the **real** model end to end. Assertions:
