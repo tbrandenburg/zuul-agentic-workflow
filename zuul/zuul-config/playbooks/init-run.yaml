@@ -105,6 +105,16 @@
                 # presence - see Phase 1 notes); defaults to false so any
                 # request omitting it behaves as a real run, unchanged.
                 mock: "{{ run_request.mock | default(false) }}"
+                # Phase 6 (task 6.3): request-level model override. Empty
+                # string (never omitted, since zuul_return's data mapping
+                # cannot use Jinja's `omit`) means "no override" - jobs.yaml's
+                # run-agent.yaml resolves the effective model as
+                # `agent_result_initialize.model or agent_model` (the
+                # job-level default, `opencode/big-pickle`). This is what
+                # lets a single POST /runs body inject a deliberately
+                # invalid model name (e.g. `does/not-exist`, task 6.3's
+                # scenario) without hardcoding a special case anywhere.
+                model: "{{ run_request.model | default('', true) }}"
                 # Phase 4: lets tool-validation fetch the exact request.json
                 # this run validated (for its allowed_paths default logic)
                 # without re-deriving the initializer's own build id.

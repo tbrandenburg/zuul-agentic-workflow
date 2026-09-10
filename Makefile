@@ -3,7 +3,8 @@
 	install build test lint format e2e-2 \
 	e2e-3 phase3-e2e-mock phase3-prove-no-stdout-leak \
 	e2e-4 phase4-e2e-mock \
-	phase5-run-api phase5-run-api-stop e2e-5 phase5-e2e-mock
+	phase5-run-api phase5-run-api-stop e2e-5 phase5-e2e-mock \
+	e2e-6 e2e-6-1 e2e-6-2 e2e-6-3 e2e-6-4 e2e-6-5 e2e-6-6 demo e2e
 
 COMPOSE := docker compose -p zuul-poc -f zuul/docker-compose.yaml
 
@@ -194,3 +195,70 @@ e2e-5:
 ## real path at zero model cost.
 phase5-e2e-mock:
 	./zuul/scripts/e2e-5.sh --mock
+
+## --- Phase 6: hardening and demonstration ---
+
+## Each of the 6 Live E2E hardening scenarios (docs/PLAN.md §11 Phase 6),
+## individually re-runnable. All cost real model tokens (no scenario sets
+## "mock": true - see zuul/scripts/e2e-6-lib.sh's header comment). Require
+## `make build`, `make phase1-reload`, and `make phase5-run-api` first.
+e2e-6-1:
+	./zuul/scripts/e2e-6-1-happy-path.sh
+
+e2e-6-2:
+	./zuul/scripts/e2e-6-2-malformed-output.sh
+
+e2e-6-3:
+	./zuul/scripts/e2e-6-3-model-failure.sh
+
+e2e-6-4:
+	./zuul/scripts/e2e-6-4-invalid-patch.sh
+
+e2e-6-5:
+	./zuul/scripts/e2e-6-5-failing-tests.sh
+
+e2e-6-6:
+	./zuul/scripts/e2e-6-6-workspace-escape.sh
+
+## Gate E2E-6 (non-mocked) = the plan's Definition of Done gate: runs all
+## six scenarios IN SEQUENCE (they share the semaphore-limited executor and
+## a single Run API instance - never run them in parallel), continuing past
+## any individual failure so a single pass reports everything wrong at
+## once (repo's own testing philosophy - "find everything wrong in one
+## pass"), then prints a clear pass/fail summary and exits non-zero if any
+## scenario failed.
+e2e-6:
+	@set +e; \
+	results=""; \
+	for n in 1 2 3 4 5 6; do \
+		echo "=== Running scenario 6.$$n ==="; \
+		./zuul/scripts/e2e-6-$$n-*.sh; \
+		rc=$$?; \
+		results="$$results $$n:$$rc"; \
+	done; \
+	echo ""; \
+	echo "=== E2E-6 summary ==="; \
+	fail=0; \
+	for pair in $$results; do \
+		n=$${pair%%:*}; \
+		rc=$${pair##*:}; \
+		if [ "$$rc" = "0" ]; then \
+			echo "  6.$$n: PASSED"; \
+		else \
+			echo "  6.$$n: FAILED (exit $$rc)"; \
+			fail=1; \
+		fi; \
+	done; \
+	exit $$fail
+
+## All Live E2E gates E2E-0..E2E-6 in sequence (plan §11.8). Costs real
+## model tokens for e2e-2/3/4/5/6.
+e2e: phase0-e2e-0 phase1-e2e-1 phase1-e2e-1-invalid e2e-2 e2e-3 e2e-4 e2e-5 e2e-6
+
+## `make demo` (plan §11.8): scripted happy-path run + a readable,
+## timestamped transcript (POST /runs response, polling progress, final
+## run-summary.md) saved to zuul/.demo-transcripts/ (gitignored - see
+## .gitignore). Requires `make build`, `make phase1-reload`, and
+## `make phase5-run-api` first. Costs real model tokens.
+demo:
+	./zuul/scripts/demo.sh
