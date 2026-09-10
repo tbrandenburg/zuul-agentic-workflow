@@ -1,0 +1,164 @@
+# Phase 3 (plan §7.6, task 3.1): shared run-phase playbook for every job
+# whose parent is the abstract `agent` job (planner-agent, coder-agent).
+# hosts: localhost - executor-only, no nodeset (plan §1.10, real
+# agent-runner node lands in Phase 4).
+#
+# Design notes (documented per the task brief):
+# - run_id/task/repo/base_ref come EXCLUSIVELY from the `agent_result_initialize`
+#   flat Ansible var returned by the initializer (extended in this phase -
+#   see init-run.yaml) - never by re-reading runs/<id>/request.json off disk,
+#   even though that file is technically still reachable at
+#   {{ zuul.executor.work_root }}/{{ zuul.project.src_dir }} in this PoC. Going
+#   through the Zuul-documented data-passing mechanism keeps a single source
+#   of truth and matches how planner->coder state passing works (task 3.3).
+# - coder-agent's upstream_results is built ONLY from the namespaced
+#   `agent_result_planner` var (task 3.2/3.3) - never from any stdout/console
+#   log file. See zuul/scripts/prove-no-stdout-leak.sh for the empirical
+#   proof (task 3.5).
+# - agent_model is a job var (default set on the abstract `agent` job,
+#   overridable per job/project) - "the model name is configuration, not
+#   hardcoded" per plan §7.5/§7.6.
+# - agent_mock is read from the run request itself
+#   (agent_result_initialize.mock, see init-run.yaml/jobs.yaml) so a single
+#   push can opt into a zero-cost dry run; there are no separate "-mock"
+#   job variants (see docs/PLAN.md Phase 3 notes for why an earlier design
+#   with such variants didn't actually work).
+- hosts: localhost
+  gather_facts: false
+  vars:
+    agent_result_dir: "{{ agent_artifacts_dir }}/{{ agent_role }}"
+  tasks:
+    - name: Create per-build working directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ agent_input_path | dirname }}"
+        - "{{ agent_workspace_path }}"
+        - "{{ agent_result_dir }}"
+
+    - name: Compose upstream_results for this role (task 3.2/3.3)
+      # coder-agent's upstream_results contains EXACTLY one entry, built
+      # solely from the flat `agent_result_planner` var (fact #2/§1.3: not
+      # namespaced under any zuul.parent_data-style structure). planner-agent
+      # has no upstream (it is the first agent role) so this stays [].
+      set_fact:
+        upstream_results: >-
+          {{
+            [{
+              'role': 'planner',
+              'summary': vars['agent_result_planner'].summary,
+              'artifact_url': vars['agent_result_planner'].artifact_url,
+              'status': vars['agent_result_planner'].status
+            }] if agent_role == 'coder' else []
+          }}
+
+    - name: Build the agent-input manifest matching agent-input.schema.json (task 3.1)
+      copy:
+        dest: "{{ agent_input_path }}"
+        mode: "0644"
+        content: |
+          {{ {
+            'schema_version': 1,
+            'run_id': agent_result_initialize.run_id,
+            'role': agent_role,
+            'task': {
+              'description': agent_result_initialize.task,
+              'repo': agent_result_initialize.repo,
+              'base_ref': agent_result_initialize.base_ref
+            },
+            'upstream_results': upstream_results,
+            'workspace': {'path': agent_workspace_path, 'mode': 'read-only'},
+            'model': agent_model
+          } | to_nice_json }}
+
+    - name: Publish the composed agent-input manifest as an artifact (needed by e2e-3's byte-identical proof and by the stdout-isolation proof)
+      copy:
+        src: "{{ agent_input_path }}"
+        dest: "{{ agent_result_dir }}/agent-input.json"
+        mode: "0644"
+        remote_src: true
+
+    - name: Run agent-runtime (real opencode call unless agent_mock is true)
+      # Zuul's Ansible execution scrubs the process environment (security
+      # hardening) before running playbooks, so PATH is NOT the docker
+      # image's `PATH=/opt/node/bin:/opt/opencode-bin:...` (compose env only
+      # sets the container's own PID-1 env, not what Ansible passes to
+      # `command:`). Use the absolute path to node AND still set
+      # `environment:` so node's own process.env.PATH (inherited by
+      # `child_process.spawn('opencode')` in
+      # packages/agent-runtime/src/opencode.ts) can find the opencode
+      # binary.
+      command: >-
+        /opt/node/bin/node /repo/packages/agent-runtime/dist/cli.js run
+        --role {{ agent_role }}
+        --input {{ agent_input_path }}
+        --output {{ agent_output_path }}
+        --prompt /repo/{{ prompt_file }}
+        --model {{ agent_model }}
+        --workspace {{ agent_workspace_path }}
+        --artifacts {{ agent_result_dir }}
+        {{ '--mock' if (agent_mock | default(false) | bool) else '' }}
+      environment:
+        PATH: /opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        HOME: /root
+      register: agent_run
+      failed_when: agent_run.rc not in [0]
+
+    - name: Write the standalone independent schema-check script (task 3.4)
+      # Deliberately does NOT reuse packages/agent-tools (empty Phase-4
+      # scaffold, out of scope this phase) - it reuses the already-built
+      # @repo/agent-contracts package instead, which is the simplest option
+      # that still gives a genuinely independent (playbook-side, not
+      # runtime-side) schema check.
+      copy:
+        dest: "/tmp/{{ zuul.build }}/check-agent-result.mjs"
+        mode: "0644"
+        content: |
+          import { readFileSync } from "node:fs";
+          import { validateAgentResult, formatErrors } from "/repo/packages/agent-contracts/dist/index.js";
+          const path = process.argv[2];
+          const data = JSON.parse(readFileSync(path, "utf-8"));
+          const result = validateAgentResult(data);
+          if (!result.valid) {
+            console.error(`agent-result.json failed independent schema validation: ${formatErrors(result.errors)}`);
+            process.exit(1);
+          }
+          console.log(JSON.stringify({ status: data.status, summary: data.summary }));
+
+    - name: Independently validate agent-result.json against the schema (task 3.4)
+      command: "/opt/node/bin/node /tmp/{{ zuul.build }}/check-agent-result.mjs {{ agent_output_path }}"
+      environment:
+        PATH: /opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      register: schema_check
+      changed_when: false
+      failed_when: schema_check.rc not in [0]
+
+    - name: Parse the independently-validated result
+      set_fact:
+        checked_result: "{{ schema_check.stdout | from_json }}"
+
+    - name: Copy the agent-result.json into the artifacts dir (task 3.1 step 4)
+      copy:
+        src: "{{ agent_output_path }}"
+        dest: "{{ agent_result_dir }}/agent-result.json"
+        mode: "0644"
+        remote_src: true
+
+    - name: Publish artifacts and return the compact, namespaced summary (task 3.1 step 4 / §7.6)
+      # Dynamic key ("agent_result_" ~ agent_role) built via a Jinja
+      # dict literal since zuul_return's `data:` mapping cannot use a Jinja
+      # expression as a literal YAML key.
+      vars:
+        result_payload:
+          role: "{{ agent_role }}"
+          status: "{{ checked_result.status }}"
+          summary: "{{ checked_result.summary }}"
+          artifact_url: "http://localhost:8000/{{ zuul.build }}/artifacts/{{ agent_role }}/agent-result.json"
+      zuul_return:
+        data: >-
+          {{
+            {('agent_result_' ~ agent_role): result_payload,
+             'zuul': {'artifacts': [{'name': agent_role ~ ' result', 'url': 'artifacts/' ~ agent_role ~ '/agent-result.json'}]}}
+          }}

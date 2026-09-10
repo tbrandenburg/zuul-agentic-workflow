@@ -4,3 +4,24 @@
       jobs:
         - initialize-agent-run
         - agent-smoke
+        # Phase 3: initialize-agent-run is auto-wired as an implicit
+        # dependency of every other listed job (plan §1.2, confirmed in
+        # Phase 1) - no explicit `dependencies: [initialize-agent-run]`
+        # needed here, verified empirically via the buildset job graph
+        # after a real e2e-3 run (both planner-agent and coder-agent show
+        # initialize-agent-run as a dependency with no such line below).
+        #
+        # Cost/determinism is opt-in PER PUSH via the request.json's own
+        # "mock": true field (read by init-run.yaml -> agent_result_initialize
+        # .mock -> jobs.yaml's agent_mock var), not via separate always-
+        # scheduled "-mock" job variants. An earlier design had
+        # planner-agent-mock/coder-agent-mock siblings that ran on EVERY
+        # push alongside these two - since Zuul has no per-push conditional
+        # job selection in a single project stanza, that never actually
+        # avoided cost: the real jobs below still ran (and could still
+        # fail) regardless of what the "-mock" siblings asserted. Fixed by
+        # collapsing back to exactly these two jobs.
+        - planner-agent
+        - coder-agent:
+            dependencies: [planner-agent]
+

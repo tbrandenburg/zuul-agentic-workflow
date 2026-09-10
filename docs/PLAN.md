@@ -1227,26 +1227,103 @@ proving a genuine model call. Reproducible via `make e2e-2`.
 
 ### Phase 3 — Planner → coder state passing
 
-| # | Task |
-|---|---|
-| 3.1 | `run-agent.yaml` building the input manifest from Zuul vars + upstream `agent_result_*` |
-| 3.2 | `planner-agent` returns namespaced compact data + artifacts |
-| 3.3 | `coder-agent` consumes **only** `agent_result_planner` + fetched artifact |
-| 3.4 | Independent playbook-side schema check |
-| 3.5 | Assert the coder never reads raw planner stdout (test: corrupt the stdout log, run must still pass) |
-| 3.6 | `make e2e-3` — Live E2E for the two-job chain |
+**STATUS: COMPLETE.** Implementation in `zuul/zuul-config/zuul.d/jobs.yaml`
+(abstract `agent` job, `planner-agent`/`coder-agent`),
+`zuul/zuul-config/zuul.d/projects.yaml`, and
+`zuul/zuul-config/playbooks/run-agent.yaml`. Reproducible via
+`make phase1-reload && make e2e-3` (real model, costs tokens) and
+`make phase3-e2e-mock` (genuinely zero cost — see the corrected design below).
 
-**Gate:** two-job chain succeeds with `--mock` (fast inner loop); coder's input
-manifest provably contains the planner's summary and artifact URL and nothing
-else.
+| # | Task | Status |
+|---|---|---|
+| 3.0 | Job graph wiring: abstract `agent` job (`parent: base`, semaphore, per-build paths), `planner-agent`/`coder-agent`, project stanza | ✅ Done — see jobs.yaml/projects.yaml comments for the per-build-path (`{{ zuul.build }}`, not bare `/tmp/agent-input.json`) and implicit-initializer-dependency decisions |
+| 3.1 | `run-agent.yaml` building the input manifest from Zuul vars + upstream `agent_result_*` | ✅ Done — `init-run.yaml` extended to also return a namespaced `agent_result_initialize` (run_id/task/repo/base_ref/mock); the runtime never re-reads `runs/<id>/request.json` |
+| 3.2 | `planner-agent` returns namespaced compact data + artifacts | ✅ Done — `agent_result_planner`/`agent_result_coder` |
+| 3.3 | `coder-agent` consumes **only** `agent_result_planner` + fetched artifact | ✅ Done — `upstream_results` built exclusively from the flat Zuul var, never a file read |
+| 3.4 | Independent playbook-side schema check | ✅ Done — a standalone `.mjs` script reusing `@repo/agent-contracts` (not `agent-tools`, deliberately out of scope) |
+| 3.5 | Assert the coder never reads raw planner stdout | ✅ Done — `zuul/scripts/prove-no-stdout-leak.sh` (static grep proof + empirical stdout.log-deletion proof) |
+| 3.6 | `make e2e-3` — Live E2E for the two-job chain | ✅ Done — `zuul/scripts/e2e-3.sh`, **PASSED**: both builds SUCCESS, both schema-valid, `planner tokens_input=1042/duration_ms=54182`, `coder tokens_input=185/duration_ms=41098`, byte-identical summary propagation confirmed |
 
-**Gate `E2E-3` (non-mocked):** the same two-job chain runs inside Zuul with the
-**real** model in both jobs. Assertions: both builds SUCCESS; both results
-schema-valid; both carry non-zero telemetry; the coder's captured input manifest
-contains a `upstream_results[0].summary` that is byte-identical to the planner's
-returned summary. Proves real cross-job state transfer, not a fixture.
+**Gate: PASSED (`make phase3-e2e-mock`).** `planner-agent`/`coder-agent` (the
+same two jobs used by the live gate) both succeed with `agent-runtime --mock`
+at genuinely zero model cost, when the pushed `request.json` sets
+`"mock": true`; the coder's captured `agent-input.json` artifact provably
+contains only the planner's `role`/`summary`/`artifact_url`/`status` in
+`upstream_results[0]` and nothing else.
 
-### Phase 4 — Patch generation and deterministic validation
+**Gate `E2E-3` (non-mocked): PASSED.** `make e2e-3` - both `planner-agent` and
+`coder-agent` builds SUCCESS, both `agent-result.json` artifacts independently
+schema-valid, both with non-zero telemetry, and the coder's captured
+`agent-input.json`'s `upstream_results[0].summary` byte-identical to the
+planner's returned summary.
+
+**Notes and deviations:**
+- **`artifact_url` must be an absolute URI, not a relative path.**
+  `agent-input.schema.json`'s `upstream_results[].artifact_url` has
+  `"format": "uri"`; a bare `artifacts/planner/agent-result.json` fails Ajv's
+  `ajv-formats` URI check (exit 10 on the coder). Fixed by composing the full
+  `http://localhost:8000/{{ zuul.build }}/artifacts/...` URL (same log-server
+  base URL already hardcoded in `base/post-logs.yaml`'s `log_url`).
+- **Zuul's bubblewrap sandbox does not expose the container's own `PATH`.**
+  Even though `docker exec ... node --version && opencode --version` (a plain
+  shell in the container) works, a *trusted-project playbook's* `command:`
+  task runs inside a `bwrap` sandbox that only binds `/usr`, `/lib`, `/bin`,
+  `/sbin` plus the job's own work/ansible dirs by default - **not** the
+  compose-level `PATH=/opt/node/bin:...` environment variable, and not the
+  `/repo`, `/opt/node`, `/opt/opencode-bin` bind mounts either. Two additive
+  fixes were required, neither optional: (1) `[executor] trusted_ro_paths=
+  /repo:/opt/node:/opt/opencode-bin` in `zuul.conf` (colon-separated - a comma
+  silently produces a single bogus combined bwrap bind path with no error
+  other than a runtime `bwrap: Can't find source path ...`, found via `-d`
+  debug logging); (2) an explicit `environment: {PATH: ..., HOME: /root}` on
+  the `command:` tasks that invoke `node`/`opencode`, since node's own
+  `child_process.spawn('opencode')` needs `PATH` in *its* `process.env`, which
+  Ansible's environment scrubbing strips independently of the executor's own
+  shell PATH.
+- **`~/.local/share/opencode` (host bind mount) needed relaxed permissions.**
+  The sandboxed job runs as a different effective identity than a plain
+  `docker exec`; writing `opencode.log` under the host-owned (uid 1000)
+  bind-mounted dir failed with `PermissionDenied` until the host directory was
+  made world-writable (`chmod -R o+rwX`). Documented as a PoC-only
+  accommodation, not a production pattern.
+- **Real-model non-determinism is real and task-description-sensitive.**
+  An overly-exploratory task description reliably made the model spend its
+  turn budget on tool calls before emitting the required fenced ` ```json `
+  block, failing `planner-agent` (exit 30). A trivial, exploration-free
+  description ("Say hello in one sentence.") fixed it reliably. `make e2e-3`
+  (the live gate only) retains a 3-attempt retry wrapper as a documented
+  accommodation for residual real-model flakiness (same category of risk the
+  plan already accepts for the Phase 4 gate).
+- **CORRECTED (coordinator review, post-handoff): the pipeline-coupled-cost
+  defect.** The implementing subagent's original design added
+  `planner-agent-mock`/`coder-agent-mock` as separate job variants, always
+  scheduled *alongside* the real `planner-agent`/`coder-agent` on every single
+  push (Zuul has no per-push conditional job selection within one project
+  stanza's job list). This meant `make phase3-e2e-mock` was **not** actually
+  zero-cost - the real jobs still ran (and could still fail) on every
+  invocation, silently burning tokens; the coordinator caught this by
+  observing a real `planner-agent` FAILURE inside a buildset that
+  `phase3-e2e-mock` nonetheless reported as "PASSED" (it only asserted on the
+  `-mock` siblings). It also meant Phase 0/1's previously-free regression
+  gates (`phase0-e2e-0`, `phase1-e2e-1`) silently started costing tokens too,
+  which the Makefile "fixed" with a blind 3-attempt retry wrapper - masking
+  the real problem rather than solving it. **Fix:** removed the `-mock` job
+  variants entirely; `agent_result_initialize.mock` (sourced from the pushed
+  `request.json`'s own optional `"mock"` field, default `false`) now drives
+  `agent_mock` on the **same** `planner-agent`/`coder-agent` jobs used by the
+  live gate. A single push now genuinely chooses cost/determinism via its own
+  content - `e2e-0.sh`/`e2e-1.sh`/`e2e-3.sh --mock` all set `"mock": true` and
+  are zero-cost and deterministic again; only `e2e-3` (no flag) and `e2e-2`
+  cost real tokens, exactly as the plan's cost-discipline section intends.
+  The retry wrapper was removed from `phase1-e2e-1` (no longer needed - it's
+  deterministic again) and kept only on `e2e-3` (still a real, accepted
+  model-flakiness risk for that one live gate).
+- `agent_model` defaults to `opencode/big-pickle` as a job var on the
+  abstract `agent` job (not hardcoded in the playbook), per plan §7.5/§7.6
+  ("the model name is configuration, not hardcoded into job definitions").
+
+
+</content>### Phase 4 — Patch generation and deterministic validation
 
 | # | Task |
 |---|---|

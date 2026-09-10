@@ -148,3 +148,106 @@ Web UI: http://localhost:9000/t/agents/buildsets (anonymous read, no login).
   place (`scripts/seed-repos.sh` and `make phase0-up`'s `mkdir -p` follow this
   rule).
 
+
+## Phase 3: planner -> coder state passing
+
+```bash
+make e2e-3                          # gate: real planner-agent -> coder-agent chain (costs model tokens)
+make phase3-e2e-mock                # fast, zero-cost inner loop (same jobs, request.json "mock": true)
+make phase3-prove-no-stdout-leak    # task 3.5: coder never reads the planner's raw stdout
+```
+
+- New abstract `agent` job (`parent: base`, `zuul.d/jobs.yaml`) finally
+  attaches the `agent-model-concurrency` global semaphore (deferred since
+  Phase 1) and carries per-build `agent_input_path`/`agent_output_path`/
+  `agent_workspace_path` under `/tmp/{{ zuul.build }}/...` - a bare
+  `/tmp/agent-input.json` would risk collision if two agent jobs (semaphore
+  `max: 2`) ran concurrently on the same executor.
+- `planner-agent`/`coder-agent` run on every push to `agent-runs` - see
+  `zuul.d/projects.yaml`. `initialize-agent-run`'s implicit dependency-on-
+  every-listed-job (Phase 1 finding) covers both with no explicit
+  `dependencies: [initialize-agent-run]` needed, verified via the buildset's
+  job graph in the web UI after a real `e2e-3` run.
+- **Cost/determinism is opt-in per push, not per job variant.** The pushed
+  `request.json` may set an optional `"mock": true` field; `init-run.yaml`
+  passes it through as `agent_result_initialize.mock`, and `jobs.yaml`'s
+  `agent_mock` var reads it, so the SAME `planner-agent`/`coder-agent` jobs
+  invoke `agent-runtime --mock` when asked to. **This replaced an earlier
+  design** with separate `planner-agent-mock`/`coder-agent-mock` job
+  variants that ran unconditionally *alongside* the real jobs on every push
+  (a single Zuul project stanza has no per-push conditional job selection) -
+  that design never actually avoided model cost, since the real jobs still
+  ran (and could still fail) regardless of which pair a test script chose to
+  assert on. Caught by the coordinator during review (a real `planner-agent`
+  FAILURE was silently ignored by a "PASSED" mock-gate result); see
+  `docs/PLAN.md`'s Phase 3 notes for the full story. `phase0-e2e-0`,
+  `phase1-e2e-1`, and `e2e-3.sh --mock` all set `"mock": true` and are
+  zero-cost/deterministic again; only `e2e-3` (no flag) and `e2e-2` spend
+  real tokens.
+- `run-agent.yaml` builds the `agent-input.json` manifest entirely from Zuul
+  vars: `run_id`/`task`/`repo`/`base_ref` from the initializer's (now
+  extended) `agent_result_initialize`, and `coder-agent`'s
+  `upstream_results` entirely from `agent_result_planner` - never by
+  re-reading `runs/<id>/request.json` or any stdout/console log.
+- `agent-input.schema.json`'s `upstream_results[].artifact_url` requires
+  `format: "uri"` (an absolute URL) - a relative `artifacts/planner/...`
+  path fails Ajv's `ajv-formats` check. `run-agent.yaml` composes the full
+  `http://localhost:8000/{{ zuul.build }}/artifacts/...` URL instead (same
+  log-server base URL `base/post-logs.yaml` already hardcodes for
+  `zuul.log_url`).
+- Independent schema validation (task 3.4, plan §7.6) is a small standalone
+  `.mjs` script written per-build that imports `@repo/agent-contracts`'s
+  already-built `dist/index.js` directly - deliberately not
+  `packages/agent-tools` (still an intentionally-empty Phase-4 scaffold).
+- Run IDs pushed by any script targeting this pipeline must be ULID-shaped
+  (`^[0-9A-HJKMNP-TV-Z]{26}$`, the `runs/<run_id>/` directory name itself,
+  not just the JSON body's own `run_id` field) - once `planner-agent`
+  actually constructs a schema-validated `agent-input.json`, a non-ULID
+  `run_id` (e.g. Phase 0's original `e2e0-<timestamp>` scheme) fails exit 10.
+
+
+### Troubleshooting notes found in Phase 3
+
+- **Zuul's bubblewrap sandbox does not inherit the container's `PATH`, even
+  for trusted-project playbooks.** `docker exec <executor> node --version`
+  working is not evidence that a Zuul job's `command: node ...` task will
+  work - `bwrap` only binds `/usr`, `/lib`, `/bin`, `/sbin` plus the job's own
+  work/ansible dirs by default. Needed **both**: (1)
+  `[executor] trusted_ro_paths=/repo:/opt/node:/opt/opencode-bin` in
+  `zuul.conf` (colon-separated, NOT comma - a comma silently becomes one
+  bogus combined bind path, surfaced only via `bwrap: Can't find source path
+  ...` in `-d` debug executor logs, with no error at the Ansible/Zuul level
+  at all - the build just shows `RETRY`/`RETRY_LIMIT` with an empty
+  `job-output.json`); (2) an explicit `environment: {PATH: ..., HOME: /root}`
+  on every `command:` task invoking `node`/`opencode`, since Ansible's own
+  environment-scrubbing is independent of the executor process's shell PATH,
+  and `node:child_process.spawn('opencode')` needs `PATH` in *its own*
+  `process.env` to find the binary.
+- **A build showing `RETRY`/`RETRY_LIMIT` with no console output and no
+  `error_detail` in the API almost always means the *pre-run* playbook
+  failed to even start** (bwrap setup error, missing bind path, etc.) - the
+  Zuul API gives no clue; restart the executor with `-f -d` (debug logging)
+  temporarily to see the actual `bwrap:` or `Ansible output:` line, then
+  revert to `-f` once fixed.
+- **A host bind-mounted directory owned by a different UID than the
+  sandboxed job's effective identity can cause `PermissionDenied`** even on
+  paths already listed as `rw` - `~/.local/share/opencode` (host uid 1000)
+  needed `chmod -R o+rwX` before `opencode.log` could be written from inside
+  a job. PoC-only workaround, not a production pattern.
+- **Real-model output-format compliance is task-description-sensitive, not
+  just "sometimes flaky".** A task description that invites the model to
+  explore a nonexistent repository (e.g. "E2E-1 smoke test" against
+  `sandbox/services/example`) reliably burns the model's turn budget on tool
+  calls before it emits the required fenced ` ```json ` block (exit 30 -
+  `no fenced json block found`), observed on ~10 consecutive real attempts.
+  A trivial, exploration-free description ("Say hello in one sentence.",
+  already used by `e2e-2`) does not exhibit this and passed first-try. When
+  a gate couples real model jobs into a shared pipeline, prefer the
+  proven-reliable trivial description over a topical-but-untested one, even
+  for an otherwise-content-irrelevant smoke test.
+- **Leftover background `docker exec` processes from manual debugging can
+  linger indefinitely and contend for CPU with the next real Zuul-triggered
+  model call** (a killed local shell/timeout does NOT kill the remote
+  container process it started) - `docker exec <c> pkill -9 -f opencode`
+  before re-running a gate if you've been debugging manually in the same
+  container.

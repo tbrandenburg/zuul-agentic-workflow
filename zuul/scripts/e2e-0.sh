@@ -23,9 +23,18 @@ git clone -q "$REPOS_DIR/agent-runs.git" "$WORKDIR/agent-runs" --branch agent-ru
 cd "$WORKDIR/agent-runs"
 
 OLDREV=$(git rev-parse HEAD)
-RUN_ID="e2e0-$(date +%s)"
+# run_id (the runs/<run_id>/ directory name) must be ULID-shaped
+# (^[0-9A-HJKMNP-TV-Z]{26}$) since Phase 3: it flows through to
+# agent-input.schema.json's run_id field once planner-agent/coder-agent
+# process this same request (in --mock mode, per request.json's "mock":
+# true field - see docs/PLAN.md Phase 3 notes).
+RUN_ID=$(python3 -c "
+import random
+alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+print(''.join(random.choice(alphabet) for _ in range(26)))
+")
 mkdir -p "runs/$RUN_ID"
-echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\",\"repo\":\"sandbox/services/example\",\"base_ref\":\"main\"}" > "runs/$RUN_ID/request.json"
+echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\",\"repo\":\"sandbox/services/example\",\"base_ref\":\"main\",\"mock\":true}" > "runs/$RUN_ID/request.json"
 git add -A
 git -c user.email=poc@local -c user.name=poc commit -q -m "run: $RUN_ID"
 NEWREV=$(git rev-parse HEAD)
