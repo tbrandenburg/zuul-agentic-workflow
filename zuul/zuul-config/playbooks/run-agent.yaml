@@ -54,6 +54,50 @@
             }] if agent_role == 'coder' else []
           }}
 
+    - name: Clone the target repo into a throwaway, per-build workspace (Phase 4, task 4.2)
+      # Only the coder needs a real, patchable git checkout - planner works
+      # off summaries only and never touches a workspace. Cloning /repo
+      # (the trusted, read-only bind mount of this whole monorepo) rather
+      # than the untrusted agent-runs project: sandbox/services/example (the
+      # coder's target repo) lives in THIS repo, not in agent-runs. This
+      # clone is itself throwaway (lives under /tmp/{{ zuul.build }}, wiped
+      # with the rest of the build workspace) - it is never /repo itself,
+      # so /repo (and therefore sandbox/services/example's real, in-tree
+      # copy) is never mutated by a coder run, matching task 4.7's proof.
+      when: agent_role == 'coder'
+      block:
+        - name: git clone /repo into the coder's throwaway workspace
+          command: "git -c safe.directory=* clone --quiet --no-hardlinks /repo {{ agent_workspace_path }}/repo-clone"
+          environment:
+            PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            HOME: /root
+            GIT_CONFIG_COUNT: "1"
+            GIT_CONFIG_KEY_0: safe.directory
+            GIT_CONFIG_VALUE_0: "*"
+
+        - name: Checkout the pinned base_sha in the throwaway clone
+          command: "git -c safe.directory=* checkout --quiet {{ agent_result_initialize.base_sha }}"
+          args:
+            chdir: "{{ agent_workspace_path }}/repo-clone"
+          environment:
+            PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            HOME: /root
+            GIT_CONFIG_COUNT: "1"
+            GIT_CONFIG_KEY_0: safe.directory
+            GIT_CONFIG_VALUE_0: "*"
+
+        - name: Compute the coder's effective workspace path (the service dir inside the clone)
+          set_fact:
+            coder_service_workspace: "{{ agent_workspace_path }}/repo-clone/{{ agent_result_initialize.repo }}"
+
+    - name: Resolve the effective workspace path/mode passed to agent-runtime (task 4.2/5.5)
+      # coder gets a real, writable checkout of its own pinned service dir;
+      # every other role keeps the existing read-only empty scratch dir
+      # (unchanged from Phase 3 - no functional change for planner).
+      set_fact:
+        effective_workspace_path: "{{ coder_service_workspace if agent_role == 'coder' else agent_workspace_path }}"
+        effective_workspace_mode: "{{ 'read-write' if agent_role == 'coder' else 'read-only' }}"
+
     - name: Build the agent-input manifest matching agent-input.schema.json (task 3.1)
       copy:
         dest: "{{ agent_input_path }}"
@@ -66,10 +110,11 @@
             'task': {
               'description': agent_result_initialize.task,
               'repo': agent_result_initialize.repo,
-              'base_ref': agent_result_initialize.base_ref
+              'base_ref': agent_result_initialize.base_ref,
+              'base_sha': agent_result_initialize.base_sha
             },
             'upstream_results': upstream_results,
-            'workspace': {'path': agent_workspace_path, 'mode': 'read-only'},
+            'workspace': {'path': effective_workspace_path, 'mode': effective_workspace_mode},
             'model': agent_model
           } | to_nice_json }}
 
@@ -97,7 +142,7 @@
         --output {{ agent_output_path }}
         --prompt /repo/{{ prompt_file }}
         --model {{ agent_model }}
-        --workspace {{ agent_workspace_path }}
+        --workspace {{ effective_workspace_path }}
         --artifacts {{ agent_result_dir }}
         {{ '--mock' if (agent_mock | default(false) | bool) else '' }}
       environment:
@@ -131,6 +176,7 @@
       command: "/opt/node/bin/node /tmp/{{ zuul.build }}/check-agent-result.mjs {{ agent_output_path }}"
       environment:
         PATH: /opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        HOME: /root
       register: schema_check
       changed_when: false
       failed_when: schema_check.rc not in [0]
@@ -146,19 +192,77 @@
         mode: "0644"
         remote_src: true
 
+    - name: (mock only) simulate the coder's file edit deterministically (Phase 4, task 4.8 mock path)
+      # agent-runtime --mock replays a recorded NDJSON transcript and never
+      # touches the filesystem (packages/agent-runtime/src/mock.ts) - there
+      # is therefore no real model edit to diff in mock mode. This
+      # playbook-level, deterministic stand-in edit is what lets
+      # `phase4-e2e-mock` exercise the SAME patch-generation/tool-validation
+      # path as a real run, at zero model cost, without inventing new
+      # agent-runtime code paths for something the mock CLI flag was never
+      # meant to do (simulate filesystem writes).
+      when: agent_role == 'coder' and (agent_mock | default(false) | bool)
+      blockinfile:
+        path: "{{ coder_service_workspace }}/index.js"
+        marker: "// {mark} MOCK CODER EDIT (phase4-e2e-mock)"
+        insertbefore: BOF
+        block: |
+          // mock-coder: deterministic comment inserted by run-agent.yaml for phase4-e2e-mock.
+
+    - name: Generate patch.diff against base_sha (Phase 4, task 4.2)
+      when: agent_role == 'coder'
+      command: "git -c safe.directory=* diff --no-color {{ agent_result_initialize.base_sha }} -- {{ agent_result_initialize.repo }}"
+      args:
+        chdir: "{{ agent_workspace_path }}/repo-clone"
+      register: coder_patch_diff
+      changed_when: false
+      environment:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        HOME: /root
+        GIT_CONFIG_COUNT: "1"
+        GIT_CONFIG_KEY_0: safe.directory
+        GIT_CONFIG_VALUE_0: "*"
+
+    - name: Publish patch.diff as a build artifact (Phase 4, task 4.2)
+      when: agent_role == 'coder'
+      copy:
+        dest: "{{ agent_result_dir }}/patch.diff"
+        content: "{{ coder_patch_diff.stdout }}\n"
+        mode: "0644"
+
     - name: Publish artifacts and return the compact, namespaced summary (task 3.1 step 4 / §7.6)
       # Dynamic key ("agent_result_" ~ agent_role) built via a Jinja
       # dict literal since zuul_return's `data:` mapping cannot use a Jinja
-      # expression as a literal YAML key.
+      # expression as a literal YAML key. Phase 4: coder additionally
+      # returns `patch_url` (and an extra zuul.artifacts entry) using the
+      # SAME "http://localhost:8000/..." URL shape as artifact_url -
+      # tool-validation (a separate build) resolves this to the equivalent
+      # /srv/static/logs/... path on the shared `logs` Docker volume rather
+      # than an actual HTTP call (see validate-result.yaml's own comment
+      # for why "localhost:8000" doesn't resolve from inside a container).
       vars:
-        result_payload:
+        base_result_payload:
           role: "{{ agent_role }}"
           status: "{{ checked_result.status }}"
           summary: "{{ checked_result.summary }}"
           artifact_url: "http://localhost:8000/{{ zuul.build }}/artifacts/{{ agent_role }}/agent-result.json"
+        result_payload: >-
+          {{
+            base_result_payload | combine(
+              {'patch_url': 'http://localhost:8000/' ~ zuul.build ~ '/artifacts/coder/patch.diff'}
+              if agent_role == 'coder' else {}
+            )
+          }}
+        base_artifacts:
+          - name: "{{ agent_role }} result"
+            url: "artifacts/{{ agent_role }}/agent-result.json"
+        extra_artifacts: >-
+          {{
+            [{'name': 'patch', 'url': 'artifacts/coder/patch.diff'}] if agent_role == 'coder' else []
+          }}
       zuul_return:
         data: >-
           {{
             {('agent_result_' ~ agent_role): result_payload,
-             'zuul': {'artifacts': [{'name': agent_role ~ ' result', 'url': 'artifacts/' ~ agent_role ~ '/agent-result.json'}]}}
+             'zuul': {'artifacts': base_artifacts + extra_artifacts}}
           }}

@@ -56,6 +56,24 @@
             dest: "{{ agent_artifacts_dir }}/run-request.json"
             mode: "0644"
 
+        - name: Resolve base_sha for the target repo from the trusted /repo mount (Phase 4, task 4.2)
+          # sandbox/services/example (the coder's target repo) lives INSIDE
+          # this same monorepo, bind-mounted read-only at /repo - not inside
+          # the agent-runs project this initializer's own worktree belongs
+          # to. Resolving base_ref -> base_sha here (once, at initializer
+          # time) is what lets every downstream job (coder-agent,
+          # tool-validation) patch against a single PINNED commit rather
+          # than a moving branch tip, per plan §6/§4.2.
+          command: "git -c safe.directory=* -C /repo rev-parse {{ run_request.base_ref }}"
+          register: base_sha_result
+          changed_when: false
+          environment:
+            PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            HOME: /root
+            GIT_CONFIG_COUNT: "1"
+            GIT_CONFIG_KEY_0: safe.directory
+            GIT_CONFIG_VALUE_0: "*"
+
         - name: Return the run-request artifact reference (combined with log_url by Zuul)
           zuul_return:
             data:
@@ -70,6 +88,14 @@
                 task: "{{ run_request.task }}"
                 repo: "{{ run_request.repo }}"
                 base_ref: "{{ run_request.base_ref }}"
+                # Phase 4 (task 4.2/4.3): pinned commit SHA the coder patches
+                # against and tool-validation's check 3 applies against.
+                base_sha: "{{ base_sha_result.stdout | trim }}"
+                # Phase 4 (task 4.4): threaded through to agent-tools'
+                # allowlist check (defaults to [] -> "anything under the
+                # repo's own service dir", see packages/agent-tools/src
+                # /allowlist.ts's resolveAllowedPaths doc comment).
+                allowed_paths: "{{ run_request.allowed_paths | default([]) }}"
                 # Opt-in, zero-cost dry-run switch (fixes a Phase 3 defect:
                 # see docs/PLAN.md Phase 3 notes - agent-model-invoking jobs
                 # used to run unconditionally on every push, which silently
@@ -79,6 +105,10 @@
                 # presence - see Phase 1 notes); defaults to false so any
                 # request omitting it behaves as a real run, unchanged.
                 mock: "{{ run_request.mock | default(false) }}"
+                # Phase 4: lets tool-validation fetch the exact request.json
+                # this run validated (for its allowed_paths default logic)
+                # without re-deriving the initializer's own build id.
+                request_artifact_url: "http://localhost:8000/{{ zuul.build }}/artifacts/run-request.json"
               zuul:
                 artifacts:
                   - name: run-request

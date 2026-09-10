@@ -251,3 +251,87 @@ make phase3-prove-no-stdout-leak    # task 3.5: coder never reads the planner's 
   container process it started) - `docker exec <c> pkill -9 -f opencode`
   before re-running a gate if you've been debugging manually in the same
   container.
+
+
+## Phase 4 — Patch generation and deterministic validation
+
+**STATUS: MOSTLY COMPLETE** (tasks 4.1-4.4, 4.7, 4.8; 4.5/4.6 deferred with
+justification — see `docs/PLAN.md`'s Phase 4 section for the full writeup).
+Reproducible via `make build && make phase1-reload && make phase4-e2e-mock`
+(zero cost) and `make e2e-4` (real model, costs tokens).
+
+Summary of what changed vs Phase 3:
+
+- `sandbox/services/example/` — the tiny target repo the coder patches. Its
+  `base_sha` is resolved **dynamically per run** by `init-run.yaml`
+  (`git -C /repo rev-parse <base_ref>`), never hardcoded.
+- `packages/agent-tools` — fully implemented (was an empty Phase-2 scaffold):
+  `agent-tools validate` runs the 9 ordered, fail-fast checks from
+  `docs/PLAN.md` §6 and writes `validation-report.json`/`.md`.
+- `coder-agent`'s `run-agent.yaml` path now clones `/repo` (never the
+  untrusted `agent-runs` project) into a throwaway per-build directory,
+  checks out the pinned `base_sha`, gives opencode a real read-write
+  checkout, and computes `patch.diff` via `git diff` afterwards.
+- A new `tool-validation` job (depends on `coder-agent`) runs
+  `agent-tools validate` and returns a namespaced `agent_result_validation`.
+
+### Key findings from Phase 4
+
+- **`"localhost:8000"` does not resolve from inside the `executor`
+  container.** The `logs` service's port mapping is only reachable from the
+  Docker host (or anything outside the compose network) — a trusted
+  playbook running INSIDE `executor` cannot `curl`/`get_url` it. `executor`
+  and `logs` already share the same named Docker volume at
+  `/srv/static/logs`, though, so `validate-result.yaml` reads the coder's
+  artifacts as plain files there instead of over HTTP — a simple
+  `http://localhost:8000/<build>/... -> /srv/static/logs/<build>/...`
+  string substitution on the already-namespaced `artifact_url`/`patch_url`
+  values. No new networking, no new bind mount.
+- **opencode's `edit` tool is `allow` by default** (verified against
+  `https://opencode.ai/docs/permissions/`) — "most permissions default to
+  allow", and `edit` is not one of the listed defaults-to-`ask`/`deny`
+  exceptions (only `read` of `.env*` files, and `doom_loop`/
+  `external_directory`, are non-`allow` by default). This meant the coder
+  could be given a genuinely writable workspace directory and actually
+  produce file edits **without** `--auto` (which plan §5.2/§9 explicitly
+  forbid as "dangerous, do not use") and without any new `opencode.json`
+  permission overrides.
+- **`agent-runtime --mock` cannot simulate a real file edit, by design** —
+  `packages/agent-runtime/src/mock.ts` replays a recorded NDJSON transcript
+  and never touches the filesystem. Rather than inventing a new
+  filesystem-writing code path inside `agent-runtime` just for the mock
+  flag (which the CLI contract never promised), `run-agent.yaml` performs
+  one small, deterministic file edit directly in the playbook when
+  `agent_role == 'coder' and agent_mock` is true, so `phase4-e2e-mock`
+  still exercises the identical patch-generation → `tool-validation` path
+  end-to-end, at zero model cost.
+- **`git clone <path>` only carries committed history, never uncommitted
+  working-tree changes or `node_modules`.** Anything `agent-tools`'
+  throwaway clones (or the coder's own workspace clone) need must already
+  be committed to the branch `/repo`'s `base_ref` resolves to — this is a
+  reason `base_sha` resolution and the coder/tool-validation flow could
+  only be smoke-tested end-to-end by the coordinator AFTER committing this
+  phase's changes, not by the implementing session itself (see the handoff
+  notes for exactly what was and was not independently verified pre-commit).
+- **Bubblewrap does not expose a bind-mounted `~/.gitconfig` to trusted
+  playbooks either** (same visibility-gap class as Phase 3's PATH/mount
+  finding). Git's "dubious ownership" check refuses any operation on `/repo`
+  (host-owned, remapped to the bwrap overflow uid `65534` inside the
+  sandbox's user namespace) even when running as root inside the sandbox.
+  `GIT_CONFIG_COUNT`/`KEY_0`/`VALUE_0` env vars and inline `-c
+  safe.directory=*` flags were tried first and were **not** sufficient
+  alone — only adding `/root/.gitconfig` itself to
+  `[executor] trusted_ro_paths` (`zuul.conf`) fixed it. Kept the env vars
+  too, as harmless defense-in-depth.
+- **Every `command:` task that shells out to `git` needs an explicit,
+  consistent `environment: {PATH, HOME}`** — a task with only `PATH` set
+  (missing `HOME`) fails the same dubious-ownership check in a way that
+  looks identical to the gitconfig-visibility bug above, wasting debugging
+  time distinguishing the two. Set both on every git-invoking task, always.
+- **Hardcoding `base_ref: "main"` in a test/gate script breaks the moment a
+  job starts actually cloning and checking out that ref on a feature branch
+  that hasn't merged yet** — `zuul/scripts/e2e-0.sh`/`e2e-1.sh`/`e2e-3.sh`
+  all had to switch to resolving `base_ref` dynamically from `/repo`'s
+  current branch (`git -C /repo rev-parse --abbrev-ref HEAD`), matching the
+  pattern `e2e-4.sh` used from the start.
+

@@ -19,6 +19,12 @@ ZUUL_URL="${ZUUL_URL:-http://localhost:9000}"
 TENANT="${TENANT:-agents}"
 PIPELINE="${PIPELINE:-agent-run}"
 PROJECT="${PROJECT:-agent-runs}"
+# Phase 4: coder-agent clones /repo and checks out base_ref for real (even
+# in --mock mode, since only the agent-runtime invocation itself is mocked,
+# not the clone/checkout step) - a hardcoded "main" would fail on any branch
+# where sandbox/services/example doesn't exist yet (e.g. before this
+# feature branch merges). Use whatever /repo actually has checked out.
+BASE_REF="$(git -C "$ROOT_DIR/.." rev-parse --abbrev-ref HEAD)"
 
 MODE="valid"
 if [ "${1:-}" = "--invalid" ]; then
@@ -53,7 +59,7 @@ if [ "$MODE" = "valid" ]; then
   # kept trivial anyway (harmless, and consistent with the other e2e
   # scripts) even though it's never sent to a real model in this mode.
   cat > "runs/$RUN_ID/request.json" <<EOF
-{"task": "Say hello in one sentence.", "repo": "sandbox/services/example", "base_ref": "main", "mock": true}
+{"task": "Say hello in one sentence.", "repo": "sandbox/services/example", "base_ref": "$BASE_REF", "mock": true}
 EOF
 else
   # Missing required "base_ref" key - must be pruned by the initializer.

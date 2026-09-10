@@ -1,0 +1,11 @@
+{
+  "name": "@sandbox/example",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tiny target service the coder agent patches (docs/PLAN.md §3, Phase 4 task 4.1). Not an npm workspace member on purpose - it is the sandboxed repo under test, not part of this tool's own build.",
+  "scripts": {
+    "lint": "eslint .",
+    "test": "node --test"
+  }
+}

@@ -10,6 +10,11 @@ ZUUL_URL="${ZUUL_URL:-http://localhost:9000}"
 TENANT="${TENANT:-agents}"
 PIPELINE="${PIPELINE:-agent-run}"
 PROJECT="${PROJECT:-agent-runs}"
+# Phase 4: coder-agent clones /repo and checks out base_ref for real (even
+# in --mock mode) - a hardcoded "main" would fail on any branch where
+# sandbox/services/example doesn't exist yet. Use whatever /repo actually
+# has checked out.
+BASE_REF="$(git -C "$ROOT_DIR/.." rev-parse --abbrev-ref HEAD)"
 
 if [ ! -d "$REPOS_DIR/agent-runs.git" ]; then
   echo "agent-runs.git not found under $REPOS_DIR; run 'make phase0-seed' first" >&2
@@ -34,7 +39,7 @@ alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 print(''.join(random.choice(alphabet) for _ in range(26)))
 ")
 mkdir -p "runs/$RUN_ID"
-echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\",\"repo\":\"sandbox/services/example\",\"base_ref\":\"main\",\"mock\":true}" > "runs/$RUN_ID/request.json"
+echo "{\"run_id\":\"$RUN_ID\",\"task\":\"E2E-0 smoke test\",\"repo\":\"sandbox/services/example\",\"base_ref\":\"$BASE_REF\",\"mock\":true}" > "runs/$RUN_ID/request.json"
 git add -A
 git -c user.email=poc@local -c user.name=poc commit -q -m "run: $RUN_ID"
 NEWREV=$(git rev-parse HEAD)

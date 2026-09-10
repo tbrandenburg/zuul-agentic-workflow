@@ -11,6 +11,7 @@ import type { AgentResult } from "./generated/AgentResult.js";
 import type { RunSummary } from "./generated/RunSummary.js";
 
 export type { TaskRequest, AgentInput, AgentResult, RunSummary };
+export { SECRET_PATTERNS } from "./secret-patterns.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const schemasDir = path.join(here, "..", "schemas");

@@ -1,0 +1,105 @@
+# Phase 4 (plan §6/§7.5, tasks 4.3/4.4): tool-validation job. Reads the
+# coder's patch.diff/agent-result.json and the original run-request.json
+# directly from the shared `logs` Docker volume (mounted identically at
+# /srv/static/logs by both the `executor` and `logs` services - see
+# zuul/docker-compose.yaml). tool-validation is a SEPARATE Zuul build from
+# coder-agent/initialize-agent-run, with its own executor work_root, so
+# there is no *ansible-level* shared filesystem path between the builds -
+# but by the time this job starts (Zuul only starts a dependent job after
+# its dependencies fully complete, including post-run), coder-agent's own
+# post-logs.yaml has already copied its artifacts into this shared volume.
+# Reading them there directly is simpler and more robust than an HTTP round
+# trip through the `logs` Apache container, which sits on a different
+# Docker network path than "localhost:8000" would suggest from inside the
+# executor container (that hostname:port only resolves for callers OUTSIDE
+# the compose network, e.g. zuul/scripts/e2e-*.sh running on the host).
+#
+# `agent-tools validate` (packages/agent-tools/src/cli.ts) does all the
+# actual work: schema, patch parse, `git apply --check` in a throwaway
+# clone, allowlist, forbidden paths, secret scan, lint, test, claims
+# cross-check (docs/PLAN.md §6's 9 ordered checks). This playbook is
+# intentionally thin - it only resolves inputs, invokes the CLI, and
+# publishes its two reports.
+- hosts: localhost
+  gather_facts: false
+  vars:
+    validation_result_dir: "{{ agent_artifacts_dir }}/validation"
+    # Every agent_result_*.artifact_url/request_artifact_url this playbook
+    # consumes is of the shape "http://localhost:8000/<build>/artifacts/...";
+    # /srv/static/logs is the SAME physical volume the `logs` service serves
+    # at "http://localhost:8000/" (zuul/docker-compose.yaml's shared `logs`
+    # named volume) - so a plain host/port -> path prefix swap resolves the
+    # on-disk location without any network call.
+    request_json_path: "{{ agent_result_initialize.request_artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/') }}"
+    coder_result_path: "{{ agent_result_coder.artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/') }}"
+    coder_patch_path: "{{ agent_result_coder.patch_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/') }}"
+  tasks:
+    - name: Create the per-build result directory
+      file:
+        path: "{{ validation_result_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Run agent-tools validate (the 9 ordered checks, docs/PLAN.md §6)
+      command: >-
+        /opt/node/bin/node /repo/packages/agent-tools/dist/cli.js validate
+        --patch {{ coder_patch_path }}
+        --result {{ coder_result_path }}
+        --request {{ request_json_path }}
+        --repo-root /repo
+        --service-dir {{ agent_result_initialize.repo }}
+        --base-sha {{ agent_result_initialize.base_sha }}
+        --report-json {{ validation_result_dir }}/validation-report.json
+        --report-md {{ validation_result_dir }}/validation-report.md
+      environment:
+        PATH: /opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        HOME: /root
+        # agent-tools clones /repo (host-owned) into a throwaway dir
+        # internally (packages/agent-tools/src/clone.ts) - same
+        # dubious-ownership footgun as run-agent.yaml's coder clone; see
+        # that file's comment for why a mounted /root/.gitconfig doesn't
+        # work here (bubblewrap doesn't expose it to trusted playbooks).
+        GIT_CONFIG_COUNT: "1"
+        GIT_CONFIG_KEY_0: safe.directory
+        GIT_CONFIG_VALUE_0: "*"
+      register: agent_tools_run
+      # Deliberately NOT failed_when rc!=0 here - a FAILING validation
+      # report is a valid, informative outcome (job result derived from
+      # validation_report.passed below, not from this command's rc alone),
+      # not an infra error.
+      changed_when: false
+      failed_when: false
+
+    - name: Read back the machine-readable report to build the namespaced summary
+      set_fact:
+        validation_report: "{{ lookup('file', validation_result_dir ~ '/validation-report.json') | from_json }}"
+
+    - name: Publish artifacts and return the compact, namespaced summary (Phase 4 task 4.4)
+      vars:
+        result_payload:
+          role: validation
+          status: "{{ 'success' if validation_report.passed else 'failure' }}"
+          summary: >-
+            {{
+              'tool-validation ' ~ ('PASSED' if validation_report.passed else 'FAILED') ~
+              ': ' ~ (validation_report.checks | length) ~
+              ' checks recorded, see validation-report.md for detail.'
+            }}
+          artifact_url: "http://localhost:8000/{{ zuul.build }}/artifacts/validation/validation-report.json"
+      zuul_return:
+        data:
+          agent_result_validation: "{{ result_payload }}"
+          zuul:
+            artifacts:
+              - name: validation-report.json
+                url: artifacts/validation/validation-report.json
+              - name: validation-report.md
+                url: artifacts/validation/validation-report.md
+
+    - name: Fail the build when tool-validation did not pass (mirrors validation_report.passed)
+      fail:
+        msg: >-
+          tool-validation FAILED - see validation-report.md
+          ({{ validation_result_dir }}/validation-report.md) for the exact
+          check and message.
+      when: not validation_report.passed
