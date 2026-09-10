@@ -42,3 +42,51 @@
       dependency" only means every other listed job automatically depends on
       it once it IS listed - it does not exempt it from being listed.
     run: playbooks/init-run.yaml
+
+- job:
+    name: agent
+    abstract: true
+    description: >
+      Phase 3 (plan §7.5): abstract job shared by all model-invoking roles.
+      parent: base (NOT null) so it inherits base's pre-run/post-run
+      (cleanup + post-logs) lifecycle - only the run-phase playbook differs
+      per role. This is where the previously-declared-but-unattached
+      agent-model-concurrency global semaphore (Phase 1 deferred risk) is
+      finally attached.
+    timeout: 1800
+    pre-timeout: 300
+    post-timeout: 300
+    attempts: 1
+    run: playbooks/run-agent.yaml
+    semaphores:
+      - name: agent-model-concurrency
+    vars:
+      # Per-build paths (not bare /tmp/agent-input.json) - two agent jobs
+      # (planner-agent, coder-agent) can run concurrently on the same
+      # executor (semaphore max is 2), so a shared literal /tmp path would
+      # risk one build's manifest clobbering another's mid-write. {{
+      # zuul.build }} is a per-build UUID, guaranteed unique.
+      agent_input_path: "/tmp/{{ zuul.build }}/agent-input.json"
+      agent_output_path: "/tmp/{{ zuul.build }}/agent-result.json"
+      agent_workspace_path: "/tmp/{{ zuul.build }}/workspace"
+      # Model is configuration, not hardcoded into job definitions (plan
+      # §7.5/§7.6) - overridable per job/project without touching this
+      # abstract job. Default kept identical to the one proven live in
+      # Phase 2's E2E-2 gate.
+      agent_model: opencode/big-pickle
+      # Zero-cost dry-run switch (task 3.6's "--mock" requirement), driven
+      # by the run request itself via agent_result_initialize.mock (see
+      # init-run.yaml) rather than by separate always-scheduled "-mock"
+      # sibling jobs. CORRECTED from an earlier design (documented in
+      # docs/PLAN.md Phase 3 notes): the original planner-agent-mock/
+      # coder-agent-mock jobs ran unconditionally on EVERY push alongside
+      # the real jobs (Zuul has no per-push conditional job selection in
+      # this pipeline), so they never actually avoided model cost - the
+      # real planner-agent/coder-agent still ran (and could still fail)
+      # every time regardless. Making the SAME two jobs read this flag from
+      # the pushed request.json is the only way a single push can actually
+      # choose real-vs-mock and get the cost/determinism it asks for.
+      agent_mock: "{{ agent_result_initialize.mock | default(false) }}"
+
+- job: {name: planner-agent, parent: agent, vars: {agent_role: planner, prompt_file: prompts/planner.md}}
+- job: {name: coder-agent,   parent: agent, vars: {agent_role: coder,   prompt_file: prompts/coder.md}}

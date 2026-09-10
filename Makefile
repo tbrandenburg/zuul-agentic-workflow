@@ -1,6 +1,7 @@
 .PHONY: phase0-up phase0-down phase0-seed phase0-token phase0-e2e-0 phase0-clean \
 	check-config phase1-e2e-1 phase1-e2e-1-invalid phase1-reload \
-	install build test lint format e2e-2
+	install build test lint format e2e-2 \
+	e2e-3 phase3-e2e-mock phase3-prove-no-stdout-leak
 
 COMPOSE := docker compose -p zuul-poc -f zuul/docker-compose.yaml
 
@@ -58,6 +59,11 @@ check-config:
 
 ## Gate for Phase 1 tasks 1.1-1.3: initializer validates+publishes an
 ## artifact, base job's log_url plumbing works end-to-end.
+## Phase 3 note: this pipeline now also runs planner-agent/coder-agent on
+## every push, but e2e-1.sh's request.json sets "mock": true so they run
+## agent-runtime --mock (zero model cost, deterministic) - this gate stays
+## free and non-flaky, as it was before Phase 3 (see docs/PLAN.md Phase 3
+## notes for the cost-coupling defect this fixes).
 phase1-e2e-1:
 	./zuul/scripts/e2e-1.sh
 
@@ -95,3 +101,30 @@ format:
 ## REAL opencode CLI. Costs real model tokens - never run as part of `test`.
 e2e-2:
 	./packages/agent-runtime/scripts/e2e-2.sh
+
+## --- Phase 3: planner -> coder state passing (zuul/zuul-config/**) ---
+
+## Gate E2E-3 (non-mocked): planner-agent -> coder-agent two-job chain runs
+## inside Zuul against the REAL model for BOTH roles (trivial task, per
+## plan §10 cost discipline). Costs real model tokens for two roles - never
+## run as part of `test`/CI without deliberate intent. Retries up to 3 times:
+## a real model occasionally does not emit the required fenced json block
+## on a given call (exit 30) - documented model non-determinism, not an
+## infra defect (same acceptance as Phase 4's own "permits one retry").
+e2e-3:
+	for i in 1 2 3; do ./zuul/scripts/e2e-3.sh && exit 0; echo "e2e-3 attempt $$i failed, retrying..." >&2; done; exit 1
+
+## Genuinely zero-model-cost inner loop for the same two-job chain: pushes
+## request.json with "mock": true, so planner-agent/coder-agent themselves
+## invoke `agent-runtime --mock` (see run-agent.yaml/init-run.yaml) instead
+## of a separate always-scheduled "-mock" job pair. Requires
+## `make phase1-reload` after any zuul-config change and the repo built
+## (`make build`) since the executor's /repo mount is read-only.
+phase3-e2e-mock:
+	./zuul/scripts/e2e-3.sh --mock
+
+## Task 3.5: prove the coder never reads the planner's raw stdout - see
+## zuul/scripts/prove-no-stdout-leak.sh for the exact reproduction and its
+## documented reasoning/limitations.
+phase3-prove-no-stdout-leak:
+	./zuul/scripts/prove-no-stdout-leak.sh

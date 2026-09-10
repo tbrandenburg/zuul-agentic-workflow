@@ -37,17 +37,28 @@ git clone -q "$REPOS_DIR/agent-runs.git" "$WORKDIR/agent-runs" --branch agent-ru
 cd "$WORKDIR/agent-runs"
 
 OLDREV=$(git rev-parse HEAD)
-RUN_ID="e2e1-$(date +%s)"
+RUN_ID=$(python3 -c "
+import random
+alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+print(''.join(random.choice(alphabet) for _ in range(26)))
+")
 mkdir -p "runs/$RUN_ID"
 
 if [ "$MODE" = "valid" ]; then
+  # Phase 3 note: planner-agent/coder-agent now share this pipeline
+  # (docs/PLAN.md §11 Phase 3 task 3.0), but "mock": true below makes them
+  # invoke agent-runtime --mock (see init-run.yaml/jobs.yaml's agent_mock
+  # var) - zero model cost and fully deterministic, so this gate stays free
+  # and non-flaky exactly as it was before Phase 3. The task description is
+  # kept trivial anyway (harmless, and consistent with the other e2e
+  # scripts) even though it's never sent to a real model in this mode.
   cat > "runs/$RUN_ID/request.json" <<EOF
-{"task": "E2E-1 smoke test", "repo": "sandbox/services/example", "base_ref": "main"}
+{"task": "Say hello in one sentence.", "repo": "sandbox/services/example", "base_ref": "main", "mock": true}
 EOF
 else
   # Missing required "base_ref" key - must be pruned by the initializer.
   cat > "runs/$RUN_ID/request.json" <<EOF
-{"task": "E2E-1 invalid-request test", "repo": "sandbox/services/example"}
+{"task": "E2E-1 invalid-request test", "repo": "sandbox/services/example", "mock": true}
 EOF
 fi
 
@@ -71,7 +82,7 @@ echo "[$MODE] Enqueued. Waiting for buildset result..." >&2
 
 BUILDSET_UUID=""
 RESULT=""
-for i in $(seq 1 60); do
+for i in $(seq 1 150); do
   RESPONSE=$(curl -s "$ZUUL_URL/api/tenant/$TENANT/buildsets?newrev=$NEWREV")
   RESULT=$(echo "$RESPONSE" | python3 -c "
 import sys, json

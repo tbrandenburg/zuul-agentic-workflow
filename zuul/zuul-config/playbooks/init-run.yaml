@@ -59,6 +59,26 @@
         - name: Return the run-request artifact reference (combined with log_url by Zuul)
           zuul_return:
             data:
+              # Phase 3 (task 3.1): namespaced per plan §1.3 so run-agent.yaml
+              # can read the validated request's run_id/task/repo/base_ref
+              # without re-parsing runs/<id>/request.json itself. Follows the
+              # same "agent_result_<role>" naming convention even though this
+              # producer is the initializer, not an agent role, to keep a
+              # single lookup convention across the whole graph.
+              agent_result_initialize:
+                run_id: "{{ run_request_rel_path.split('/')[1] }}"
+                task: "{{ run_request.task }}"
+                repo: "{{ run_request.repo }}"
+                base_ref: "{{ run_request.base_ref }}"
+                # Opt-in, zero-cost dry-run switch (fixes a Phase 3 defect:
+                # see docs/PLAN.md Phase 3 notes - agent-model-invoking jobs
+                # used to run unconditionally on every push, which silently
+                # cost real tokens even for infra-only regression checks).
+                # Not part of task-request.schema.json (no strict schema
+                # validation of request.json content yet, only required-key
+                # presence - see Phase 1 notes); defaults to false so any
+                # request omitting it behaves as a real run, unchanged.
+                mock: "{{ run_request.mock | default(false) }}"
               zuul:
                 artifacts:
                   - name: run-request

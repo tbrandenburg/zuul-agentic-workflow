@@ -106,6 +106,14 @@ services:
         condition: service_completed_successfully
     environment:
       - ZUUL_MYSQL_PASSWORD=secret
+      # Phase 3: agent-runtime + opencode need Node and the real opencode
+      # CLI available inside the job's execution environment. The real
+      # agent-runner node (Phase 4) will carry these properly; for now the
+      # host's own Node/opencode install is bind-mounted in (PoC-only -
+      # this is NOT how a shipped isolation boundary would work, see
+      # plan §9/§1.10 "known limitation").
+      - PATH=/opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - HOME=/root
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -117,6 +125,10 @@ services:
       - "certs:/var/certs:z"
       - "logs:/srv/static/logs:z"
       - "lib-zuul-executor:/var/lib/zuul:z"
+      - "..:/repo:ro"
+      - "${HOME}/.opencode/bin:/opt/opencode-bin:ro"
+      - "${HOME}/.nvm/versions/node/v24.15.0:/opt/node:ro"
+      - "${HOME}/.local/share/opencode:/root/.local/share/opencode:rw"
     networks:
       - zuul
 
