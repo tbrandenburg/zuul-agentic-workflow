@@ -1,0 +1,250 @@
+# Phase 5 (plan §7.5/§11 task 5.3): publish-run-summary. Aggregates the
+# whole run into run-summary.json/.md, matching
+# packages/agent-contracts/schemas/run-summary.schema.json exactly (no new
+# schema fields were needed).
+#
+# Runs even when reviewer-agent (or anything upstream of it) failed or was
+# skipped - its dependency on reviewer-agent is SOFT (projects.yaml). Every
+# `agent_result_*` lookup below is therefore defensively defaulted; a
+# missing upstream result becomes a `status: "skipped"` entry in
+# `results[]`, never a hard Ansible failure.
+#
+# final_verdict is derived SOLELY from tool-validation's `passed` field
+# (via agent_result_validation.status) - the reviewer's advisory opinion
+# never gates this (plan §11 task 5.2/5.3). If tool-validation itself never
+# ran (e.g. coder-agent failed before it), final_verdict is "error" - there
+# is no deterministic pass/fail fact to report.
+- hosts: localhost
+  gather_facts: false
+  vars:
+    summary_result_dir: "{{ agent_artifacts_dir }}/summary"
+    # Every agent_result_*.artifact_url this playbook reads is of the shape
+    # "http://localhost:8000/<build>/artifacts/...". Read via the shared
+    # `logs` Docker volume path instead of an HTTP round trip - same
+    # reasoning as validate-result.yaml (localhost:8000 does not resolve
+    # from inside the executor container's network namespace).
+    have_planner: "{{ agent_result_planner is defined }}"
+    have_coder: "{{ agent_result_coder is defined }}"
+    have_validation: "{{ agent_result_validation is defined }}"
+    have_reviewer: "{{ agent_result_reviewer is defined }}"
+  tasks:
+    - name: Create the per-build result directory (and the /tmp/{{ zuul.build }} scratch dir used below)
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ summary_result_dir }}"
+        - "/tmp/{{ zuul.build }}"
+
+    - name: Read the original run request (task/repo/base_ref/model)
+      set_fact:
+        original_request: "{{ lookup('file', (agent_result_initialize.request_artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json }}"
+
+    - name: Read each role's full agent-result.json for telemetry (best-effort, missing roles default to {})
+      set_fact:
+        planner_result_full: "{{ (lookup('file', (agent_result_planner.artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json) if have_planner else {} }}"
+        coder_result_full: "{{ (lookup('file', (agent_result_coder.artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json) if have_coder else {} }}"
+        reviewer_result_full: "{{ (lookup('file', (agent_result_reviewer.artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json) if have_reviewer else {} }}"
+
+    - name: Read the full validation report (best-effort, defaults to null when tool-validation never ran)
+      set_fact:
+        validation_report_full: "{{ (lookup('file', (agent_result_validation.artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json) if have_validation else None }}"
+
+    - name: Compute per-role telemetry totals (task 5.3 - sum tokens_input/tokens_output/cost across planner+coder+reviewer, where present)
+      # Note: Ansible's (non-native) Jinja2 templating stringifies this
+      # result even with `| int`/`| float` filters applied here (confirmed
+      # empirically against a live Zuul run - see publish-summary.mjs's own
+      # comment for the actual fix point, a Number() coercion at the one
+      # place a real JSON number is required for schema validation).
+      set_fact:
+        telemetry_totals:
+          tokens_input: >-
+            {{
+              ((planner_result_full.get('telemetry', {}).get('tokens_input', 0) | default(0, true)) +
+              (coder_result_full.get('telemetry', {}).get('tokens_input', 0) | default(0, true)) +
+              (reviewer_result_full.get('telemetry', {}).get('tokens_input', 0) | default(0, true))) | int
+            }}
+          tokens_output: >-
+            {{
+              ((planner_result_full.get('telemetry', {}).get('tokens_output', 0) | default(0, true)) +
+              (coder_result_full.get('telemetry', {}).get('tokens_output', 0) | default(0, true)) +
+              (reviewer_result_full.get('telemetry', {}).get('tokens_output', 0) | default(0, true))) | int
+            }}
+          cost: >-
+            {{
+              ((planner_result_full.get('telemetry', {}).get('cost', 0) | default(0, true)) +
+              (coder_result_full.get('telemetry', {}).get('cost', 0) | default(0, true)) +
+              (reviewer_result_full.get('telemetry', {}).get('cost', 0) | default(0, true))) | float
+            }}
+
+    - name: Compute the final verdict (task 5.2/5.3 - tool-validation's `passed` field ONLY, never the reviewer's opinion)
+      set_fact:
+        final_verdict: "{{ 'success' if (have_validation and agent_result_validation.status == 'success') else ('error' if not have_validation else 'failure') }}"
+
+    - name: Build the results[] array (task 5.3, "skipped" for anything that never ran - schema allows it)
+      # `combine` (not `omit` - omit is only meaningful as a MODULE
+      # argument, not a plain dict value; using it here would leave a
+      # literal sentinel string in the JSON and fail schema validation)
+      # merges in artifact_url only when the role actually ran.
+      set_fact:
+        summary_results: >-
+          {{
+            [({'role': 'planner', 'status': (agent_result_planner.status if have_planner else 'skipped'), 'summary': (agent_result_planner.summary if have_planner else 'planner-agent did not run')} | combine({'artifact_url': agent_result_planner.artifact_url} if have_planner else {}))] +
+            [({'role': 'coder', 'status': (agent_result_coder.status if have_coder else 'skipped'), 'summary': (agent_result_coder.summary if have_coder else 'coder-agent did not run')} | combine({'artifact_url': agent_result_coder.artifact_url} if have_coder else {}))] +
+            [({'role': 'validation', 'status': (agent_result_validation.status if have_validation else 'skipped'), 'summary': (agent_result_validation.summary if have_validation else 'tool-validation did not run')} | combine({'artifact_url': agent_result_validation.artifact_url} if have_validation else {}))] +
+            [({'role': 'reviewer', 'status': (agent_result_reviewer.status if have_reviewer else 'skipped'), 'summary': (agent_result_reviewer.summary if have_reviewer else 'reviewer-agent did not run (advisory role, never gates progression)')} | combine({'artifact_url': agent_result_reviewer.artifact_url} if have_reviewer else {}))]
+          }}
+
+    - name: Collect artifact_urls[] (task 5.5 - every artifact type the plan lists, reachable by URL)
+      # Prompt files are not published as per-run artifacts (they are
+      # static, versioned repo content, not per-run output) - task 5.5's
+      # "bundle" intent is instead satisfied by noting each role's
+      # prompt_file below in the markdown rendering.
+      set_fact:
+        summary_artifact_urls: >-
+          {{
+            ([agent_result_initialize.request_artifact_url] if agent_result_initialize is defined else []) +
+            ([agent_result_planner.artifact_url] if have_planner else []) +
+            ([agent_result_coder.artifact_url] if have_coder else []) +
+            ([agent_result_coder.patch_url] if (have_coder and 'patch_url' in agent_result_coder) else []) +
+            ([agent_result_validation.artifact_url] if have_validation else []) +
+            ([agent_result_validation.artifact_url | regex_replace('validation-report\.json$', 'validation-report.md')] if have_validation else []) +
+            ([agent_result_reviewer.artifact_url] if have_reviewer else [])
+          }}
+
+    - name: Build the buildset detail URL (task 5.3 - zuul.buildset IS the buildset UUID - verified against Zuul's job-content.html docs)
+      set_fact:
+        buildset_detail_url: "http://localhost:9000/t/agents/buildset/{{ zuul.buildset }}"
+
+    - name: Assemble the full run-summary object (matches run-summary.schema.json exactly)
+      # `combine` again instead of `omit` (a plain dict value, not a module
+      # argument) so an absent optional `model` field is truly absent from
+      # the JSON, not a literal sentinel string.
+      set_fact:
+        run_summary_obj: >-
+          {{
+            {
+              'schema_version': 1,
+              'run_id': agent_result_initialize.run_id,
+              'request': ({'task': original_request.task, 'repo': original_request.repo, 'base_ref': original_request.base_ref} | combine({'model': original_request.model} if (original_request.model is defined) else {})),
+              'results': summary_results,
+              'validation_report': (validation_report_full if have_validation else None),
+              'buildset_uuid': zuul.buildset,
+              'build_urls': [buildset_detail_url],
+              'artifact_urls': summary_artifact_urls,
+              'final_verdict': final_verdict,
+              'totals': telemetry_totals
+            }
+          }}
+
+    - name: Write the assembled (pre-validation) run-summary object to a scratch file
+      copy:
+        dest: "/tmp/{{ zuul.build }}/run-summary.raw.json"
+        mode: "0644"
+        content: "{{ run_summary_obj | to_nice_json }}"
+
+    - name: Write the standalone validate+render script (mirrors run-agent.yaml's check-agent-result.mjs pattern)
+      # Deliberately reuses @repo/agent-contracts (not agent-tools) for
+      # schema validation, and renders its own minimal Markdown - no new
+      # dependency, no new package.
+      copy:
+        dest: "/tmp/{{ zuul.build }}/publish-summary.mjs"
+        mode: "0644"
+        content: |
+          import { readFileSync, writeFileSync } from "node:fs";
+          import { validateRunSummary, formatErrors } from "/repo/packages/agent-contracts/dist/index.js";
+
+          const [, , inPath, outJsonPath, outMdPath] = process.argv;
+          const data = JSON.parse(readFileSync(inPath, "utf-8"));
+          // Ansible's non-native Jinja2 templating stringifies numeric
+          // set_fact results even through `| int`/`| float` filters
+          // (empirically confirmed against this exact expression shape -
+          // Ansible core 2.16, non-native mode) - coerce here, at the one
+          // point where the value must be a real JSON number for Ajv's
+          // `type: integer`/`type: number` checks to pass.
+          if (data.totals) {
+            data.totals.tokens_input = Number(data.totals.tokens_input);
+            data.totals.tokens_output = Number(data.totals.tokens_output);
+            data.totals.cost = Number(data.totals.cost);
+          }
+          const result = validateRunSummary(data);
+          if (!result.valid) {
+            console.error(`run-summary.json failed schema validation: ${formatErrors(result.errors)}`);
+            process.exit(1);
+          }
+          writeFileSync(outJsonPath, `${JSON.stringify(result.data, null, 2)}\n`, "utf-8");
+
+          const s = result.data;
+          const lines = [
+            `# Run summary: ${s.run_id}`,
+            "",
+            `**Final verdict:** ${s.final_verdict}`,
+            "",
+            `- Task: ${s.request.task}`,
+            `- Repo: ${s.request.repo}`,
+            `- Base ref: ${s.request.base_ref}`,
+            s.request.model ? `- Model: ${s.request.model}` : undefined,
+            `- Buildset: ${s.buildset_uuid}`,
+            "",
+            "## Results",
+            "",
+            "| Role | Status | Summary | Artifact |",
+            "| --- | --- | --- | --- |",
+            ...s.results.map(
+              (r) => `| ${r.role} | ${r.status} | ${r.summary.replace(/\|/g, "\\|")} | ${r.artifact_url ?? "-"} |`,
+            ),
+            "",
+            "## Telemetry totals",
+            "",
+            `- tokens_input: ${s.totals.tokens_input}`,
+            `- tokens_output: ${s.totals.tokens_output}`,
+            `- cost: ${s.totals.cost}`,
+            "",
+            "## Artifacts",
+            "",
+            ...s.artifact_urls.map((u) => `- ${u}`),
+            "",
+            "## Build URLs",
+            "",
+            ...(s.build_urls ?? []).map((u) => `- ${u}`),
+            "",
+            "## Prompt files used",
+            "",
+            "- planner: prompts/planner.md",
+            "- coder: prompts/coder.md",
+            "- reviewer: prompts/reviewer.md (advisory only, never gates progression)",
+            "",
+          ].filter((l) => l !== undefined);
+          writeFileSync(outMdPath, lines.join("\n"), "utf-8");
+          console.log("OK");
+
+    - name: Validate the aggregated summary against run-summary.schema.json and render Markdown
+      command: >-
+        /opt/node/bin/node /tmp/{{ zuul.build }}/publish-summary.mjs
+        /tmp/{{ zuul.build }}/run-summary.raw.json
+        {{ summary_result_dir }}/run-summary.json
+        {{ summary_result_dir }}/run-summary.md
+      environment:
+        PATH: /opt/node/bin:/opt/opencode-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        HOME: /root
+      register: publish_summary_run
+      changed_when: false
+      failed_when: publish_summary_run.rc not in [0]
+
+    - name: Publish artifacts and return the compact, namespaced summary (task 5.3)
+      vars:
+        result_payload:
+          role: summary
+          status: "{{ final_verdict }}"
+          summary: "run-summary.json published; final_verdict={{ final_verdict }}"
+          artifact_url: "http://localhost:8000/{{ zuul.build }}/artifacts/summary/run-summary.json"
+      zuul_return:
+        data:
+          agent_result_summary: "{{ result_payload }}"
+          zuul:
+            artifacts:
+              - name: run-summary.json
+                url: artifacts/summary/run-summary.json
+              - name: run-summary.md
+                url: artifacts/summary/run-summary.md

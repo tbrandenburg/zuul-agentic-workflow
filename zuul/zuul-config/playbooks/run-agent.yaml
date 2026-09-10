@@ -38,21 +38,54 @@
         - "{{ agent_workspace_path }}"
         - "{{ agent_result_dir }}"
 
-    - name: Compose upstream_results for this role (task 3.2/3.3)
+    - name: Compose upstream_results for this role (task 3.2/3.3, extended Phase 5 task 5.1)
       # coder-agent's upstream_results contains EXACTLY one entry, built
       # solely from the flat `agent_result_planner` var (fact #2/§1.3: not
-      # namespaced under any zuul.parent_data-style structure). planner-agent
-      # has no upstream (it is the first agent role) so this stays [].
+      # namespaced under any zuul.parent_data-style structure). reviewer-
+      # agent's upstream_results contains TWO entries - agent_result_coder
+      # AND agent_result_validation (task 5.1) - so the reviewer sees both
+      # what the coder claims to have done and the deterministic
+      # tool-validation verdict. planner-agent has no upstream (it is the
+      # first agent role) so this stays [].
       set_fact:
         upstream_results: >-
           {{
-            [{
+            ([{
               'role': 'planner',
               'summary': vars['agent_result_planner'].summary,
               'artifact_url': vars['agent_result_planner'].artifact_url,
               'status': vars['agent_result_planner'].status
-            }] if agent_role == 'coder' else []
+            }] if agent_role == 'coder' else
+            [{
+              'role': 'coder',
+              'summary': vars['agent_result_coder'].summary,
+              'artifact_url': vars['agent_result_coder'].artifact_url,
+              'status': vars['agent_result_coder'].status
+            }, {
+              'role': 'validation',
+              'summary': vars['agent_result_validation'].summary,
+              'artifact_url': vars['agent_result_validation'].artifact_url,
+              'status': vars['agent_result_validation'].status
+            }] if agent_role == 'reviewer' else [])
           }}
+
+    - name: Fetch the validation report for the reviewer role (task 5.1)
+      # Passed via agent-input.schema.json's existing `validation` field
+      # (already defined since Phase 2, never used until now) rather than
+      # inventing a new schema field - the reviewer prompt already renders
+      # `input.validation` verbatim (packages/agent-runtime/src/prompt.ts).
+      # Read directly off the shared `logs` Docker volume, same
+      # http://localhost:8000/... -> /srv/static/logs/... substitution
+      # pattern as validate-result.yaml (that hostname:port does not
+      # resolve from inside the executor container's network namespace).
+      when: agent_role == 'reviewer'
+      set_fact:
+        reviewer_validation_report: "{{ lookup('file', (vars['agent_result_validation'].artifact_url | regex_replace('^http://localhost:8000/', '/srv/static/logs/'))) | from_json }}"
+
+    - name: Default validation report to null for non-reviewer roles
+      set_fact:
+        reviewer_validation_report: null
+      when: agent_role != 'reviewer'
 
     - name: Clone the target repo into a throwaway, per-build workspace (Phase 4, task 4.2)
       # Only the coder needs a real, patchable git checkout - planner works
@@ -114,6 +147,7 @@
               'base_sha': agent_result_initialize.base_sha
             },
             'upstream_results': upstream_results,
+            'validation': reviewer_validation_report,
             'workspace': {'path': effective_workspace_path, 'mode': effective_workspace_mode},
             'model': agent_model
           } | to_nice_json }}

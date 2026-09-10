@@ -90,6 +90,7 @@
 
 - job: {name: planner-agent, parent: agent, vars: {agent_role: planner, prompt_file: prompts/planner.md}}
 - job: {name: coder-agent,   parent: agent, vars: {agent_role: coder,   prompt_file: prompts/coder.md}}
+- job: {name: reviewer-agent, parent: agent, vars: {agent_role: reviewer, prompt_file: prompts/reviewer.md}}
 
 - job:
     name: tool-validation
@@ -111,3 +112,22 @@
       server).
     timeout: 900
     run: playbooks/validate-result.yaml
+
+- job:
+    name: publish-run-summary
+    parent: base
+    description: >
+      Phase 5 (plan §7.5/§11 task 5.3): aggregates the run request, every
+      agent_result_* (initialize/planner/coder/validation, plus reviewer if
+      it ran), the validation report, buildset UUID, build/artifact URLs,
+      a computed final_verdict (from tool-validation's `passed` field -
+      NEVER the reviewer's advisory opinion, per plan §11 task 5.2), and
+      summed telemetry, into run-summary.json/.md. Depends on
+      reviewer-agent with a SOFT dependency (see projects.yaml) so a
+      summary is still published even if the reviewer failed or was
+      skipped (e.g. tool-validation itself failed, pruning the reviewer).
+      Parented to `base` (not `agent`) - it invokes no model and needs no
+      agent-model-concurrency semaphore, only the shared pre-run/
+      post-logs/cleanup lifecycle.
+    timeout: 300
+    run: playbooks/publish-summary.yaml

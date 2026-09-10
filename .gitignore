@@ -40,3 +40,7 @@ artifacts/
 .env
 .env.*
 !.env.example
+
+# Run API's local run_id -> newrev index (Phase 5, plan §8) - regenerated
+# per Run API instance, never source of truth.
+run-api-index.json

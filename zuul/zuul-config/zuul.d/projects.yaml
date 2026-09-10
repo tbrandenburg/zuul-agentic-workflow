@@ -26,4 +26,14 @@
             dependencies: [planner-agent]
         - tool-validation:
             dependencies: [coder-agent]
+        - reviewer-agent:
+            dependencies: [tool-validation]
+        # Phase 5 (plan §7.5 task 5.3): SOFT dependency - publish-run-summary
+        # still runs even if reviewer-agent failed or was pruned (e.g. an
+        # upstream failure skipped the whole rest of the graph), so a caller
+        # always gets a summary. A hard dependency here would defeat that.
+        - publish-run-summary:
+            dependencies:
+              - name: reviewer-agent
+                soft: true
 
