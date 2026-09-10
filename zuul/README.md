@@ -335,3 +335,86 @@ Summary of what changed vs Phase 3:
   current branch (`git -C /repo rev-parse --abbrev-ref HEAD`), matching the
   pattern `e2e-4.sh` used from the start.
 
+## Phase 5 — Review, run summary, and the Run API
+
+Adds `reviewer-agent` (advisory only — its verdict is recorded but never
+gates progression) and `publish-run-summary` (soft-dependent on
+`reviewer-agent`, so a summary is always published even if the reviewer
+failed or was skipped) to the job graph, and implements the real Run API
+HTTP server (`apps/run-api/src/server.ts`) that every prior phase's
+`e2e-N.sh` scripts stood in for by pushing directly to the bare git repo.
+
+Reproduce via:
+
+```bash
+make build
+make phase1-reload
+make phase5-run-api        # starts the Run API in the background on :4100
+make phase5-e2e-mock       # zero-cost gate, drives the run via POST /runs
+make e2e-5                 # real model, costs tokens
+make phase5-run-api-stop
+```
+
+**Live-verified findings (this phase, on this host):**
+
+- `GET /api/tenant/<tenant>/buildsets` (list) does **not** include a
+  `builds` array — only `GET /api/tenant/<tenant>/buildset/<uuid>` (detail)
+  does. `apps/run-api/src/server.ts`'s `resolveBuildsetSummary` therefore
+  always makes two REST calls per status check, not one. This is not
+  documented anywhere in the plan's §8/§13 REST API table and was only
+  discovered by running the real server against the live stack.
+- `zuul.buildset` (a plain Ansible fact — no REST call needed) **is** the
+  buildset UUID (confirmed against Zuul's own job-content.html docs).
+  `publish-summary.yaml` uses it directly for `run-summary.json`'s
+  `buildset_uuid` and the buildset detail-page URL in `build_urls[]`.
+- **Ansible's non-native Jinja2 templating silently stringifies numeric
+  `set_fact` results**, even through explicit `| int`/`| float` filters,
+  when the expression lives inside a multi-line `>-` folded block scalar.
+  This is an Ansible behaviour (reproduced with a 4-line playbook run via
+  plain `ansible-playbook`, entirely outside Zuul/bwrap) — NOT a Zuul or
+  sandbox quirk. `publish-summary.yaml`'s telemetry totals therefore get a
+  final `Number(...)` coercion in the companion Node validation script
+  (`publish-summary.mjs`), the one point a real JSON number is actually
+  required (Ajv's `type: integer`/`type: number` checks).
+- A `regex_replace` pattern written as `'validation-report\\.json$'`
+  (double-escaped, as if inside a YAML double-quoted string) does not
+  match inside a plain Jinja template string — the correct pattern is a
+  single backslash, `'validation-report\.json$'`. This produced a subtly
+  wrong `artifact_urls[]` (the `.json` report listed twice, the `.md`
+  report never referenced) until caught by inspecting the live output.
+- Any new `command:`/`copy:` task under `/tmp/{{ zuul.build }}/...` must
+  create that directory first, exactly like every existing task in
+  `run-agent.yaml` already does — `publish-summary.yaml`'s very first live
+  run failed with "Destination directory does not exist" from a missing
+  `file: {state: directory}` task, the exact same class of omission
+  documented in earlier phases for other paths.
+- **A stale/wedged `executor` container can cause every job's `pre-run` to
+  fail silently** (`RETRY` → `RETRY_LIMIT`, empty console output,
+  `log_url: null`), reproducing even against previously-passing,
+  completely untouched playbooks (`e2e-1.sh`). `docker compose restart
+  executor` (not `down -v`) resolved it immediately. Not a Phase 5 code
+  defect — flagged here so a future session recognises the symptom
+  quickly rather than assuming a config regression.
+- `GET /buildsets` supports `?ref=&newrev=` filtering exactly as documented
+  (plan §13); `Run API`'s `GET /runs/:id`/`/runs/:id/summary` use this to
+  resolve a `run_id` to its buildset without re-deriving it from git
+  history.
+
+**Port choice:** the Run API listens on **4100** by default
+(`RUN_API_PORT` env var to override) — chosen after checking `ss -tln` for
+already-bound ports on this host (8000 `logs`, 9000 `zuul-web`, plus
+several unrelated dev services on 3000/3010/5173/8010/8888/8890/9090).
+
+**Coordinator's live `e2e-5` run (post-handoff):** first attempt failed at
+`planner-agent` (exit 30, the same real-model non-determinism documented in
+Phases 3/4, not a Phase 5 defect); one retry PASSED with real telemetry
+(`tokens_input=1349`, `tokens_output=919`). On the *failing* attempt,
+`publish-run-summary` was `SKIPPED` despite its `soft: true` dependency on
+`reviewer-agent` — the soft link tolerated its direct parent being
+skipped, but the skip originated several levels upstream
+(`planner-agent` → `coder-agent` → `tool-validation` → `reviewer-agent`,
+all hard dependencies), and that did not trigger `publish-run-summary`
+anyway. "A caller always gets a summary" is therefore not fully guaranteed
+by the current wiring — noted for a future phase, not fixed here (a retry
+was the plan-sanctioned response to this specific failure class).
+

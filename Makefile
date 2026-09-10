@@ -2,7 +2,8 @@
 	check-config phase1-e2e-1 phase1-e2e-1-invalid phase1-reload \
 	install build test lint format e2e-2 \
 	e2e-3 phase3-e2e-mock phase3-prove-no-stdout-leak \
-	e2e-4 phase4-e2e-mock
+	e2e-4 phase4-e2e-mock \
+	phase5-run-api phase5-run-api-stop e2e-5 phase5-e2e-mock
 
 COMPOSE := docker compose -p zuul-poc -f zuul/docker-compose.yaml
 
@@ -151,3 +152,45 @@ e2e-4:
 ## validation path against a real (if trivial) patch, at zero cost.
 phase4-e2e-mock:
 	./zuul/scripts/e2e-4.sh --mock
+
+## --- Phase 5: review, run summary, and the real Run API ---
+
+## Starts the Run API server (apps/run-api) in the background, listening on
+## RUN_API_PORT (default 4100 - chosen after checking `ss -tln` for a free
+## port, see docs/PLAN.md Phase 5 notes). Requires `make build` first. Logs
+## to /tmp/run-api.log; PID recorded in /tmp/run-api.pid so
+## phase5-run-api-stop can clean it up. Re-runnable: skips if already
+## listening on /healthz.
+phase5-run-api:
+	@if curl -s -o /dev/null -w '%{http_code}' http://localhost:$${RUN_API_PORT:-4100}/healthz 2>/dev/null | grep -q '^200$$'; then \
+		echo "run-api already up on port $${RUN_API_PORT:-4100}"; \
+	else \
+		RUN_API_PORT=$${RUN_API_PORT:-4100} nohup node apps/run-api/dist/server.js > /tmp/run-api.log 2>&1 & echo $$! > /tmp/run-api.pid; \
+		for i in $$(seq 1 30); do \
+			curl -s -o /dev/null -w '%{http_code}' http://localhost:$${RUN_API_PORT:-4100}/healthz 2>/dev/null | grep -q '^200$$' && break; \
+			sleep 1; \
+		done; \
+		echo "run-api started, pid=$$(cat /tmp/run-api.pid), port=$${RUN_API_PORT:-4100}, log=/tmp/run-api.log"; \
+	fi
+
+## Stops the background Run API server started by phase5-run-api.
+phase5-run-api-stop:
+	@if [ -f /tmp/run-api.pid ]; then kill "$$(cat /tmp/run-api.pid)" 2>/dev/null || true; rm -f /tmp/run-api.pid; echo "run-api stopped"; else echo "no run-api.pid found"; fi
+
+## Gate E2E-5 (non-mocked) — the headline milestone: `POST /runs` against
+## the real Run API drives all 6 real jobs (+ the initializer) with the
+## REAL model end to end, then validates run-summary.json and every
+## artifact it references. Costs real model tokens for planner/coder/
+## reviewer. Requires `make build`, `make phase1-reload`, and
+## `make phase5-run-api` first.
+e2e-5:
+	./zuul/scripts/e2e-5.sh
+
+## Genuinely zero-model-cost inner loop for the same POST-/runs-driven
+## chain: the request body sets "mock": true, so planner-agent/coder-agent/
+## reviewer-agent invoke agent-runtime --mock (see run-agent.yaml); coder-
+## agent's playbook still performs one real, deterministic file edit + git
+## diff, so tool-validation and publish-run-summary exercise the identical
+## real path at zero model cost.
+phase5-e2e-mock:
+	./zuul/scripts/e2e-5.sh --mock

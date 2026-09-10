@@ -6,9 +6,11 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc -b",
-    "test": "vitest run"
+    "test": "vitest run",
+    "start": "node dist/server.js"
   },
   "dependencies": {
-    "@repo/agent-contracts": "*"
+    "@repo/agent-contracts": "*",
+    "fastify": "^5.0.0"
   }
 }
